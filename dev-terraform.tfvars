@@ -1,0 +1,13 @@
+primary_region      = "us-east-1"
+environment         = "dev"
+project_name        = "ce"
+team_name           = "training"
+cost_center         = "engineering"
+compliance          = "internal"
+github_org          = "darvin-rakotomalala"
+github_repo         = "s3-static-website"
+email_subscriptions = ["darvintojo@gmail.com"]
+bucket_name         = "ce-dev-terraform-state-69127"
+table_name          = "ce-dev-terraform-locks"
+domain_name         = "cloudwithdarvin.com"
+source_files        = "webfiles"

@@ -1,0 +1,125 @@
+name: Static website Terraform CI/CD with OIDC
+
+# Event that triggers the workflow
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'static website architecture.jpg'
+      - 'Documentation/**'
+      - 'Screenshot verification/**'
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'static website architecture.jpg'
+      - 'Documentation/**'
+      - 'Screenshot verification/**'
+
+env:
+  # verbosity setting for Terraform logs
+  TF_LOG: INFO
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  TF_BACKEND_S3_BUCKET: ${{ vars.TF_BACKEND_S3_BUCKET }}
+  TF_VERSION: ${{ vars.TF_VERSION }}
+  WEBSITE_BUCKET_NAME: ${{ vars.WEBSITE_BUCKET_NAME }}
+  DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
+  # WORKING_DIR: './terraform'
+
+permissions:
+  id-token: write       # Required for requesting the OIDC JWT
+  contents: read        # Required for actions/checkout
+  pull-requests: write  # Required for plan comments
+  issues: write
+
+# Contains a list of jobs. Each job runs in parallel by default and in an isolated environment.
+jobs:
+  terraform:
+    # needs: security
+    name: Static website
+    runs-on: ubuntu-latest
+    environment: dev
+    # defaults:
+    # run:
+    # working-directory: ${{ env.WORKING_DIR }}
+
+    # A list of steps that execute in order.
+    ## (Optional) Continue only if security checks pass
+    steps:
+      # Authenticate to AWS via OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6.1.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout the repository to the runner
+        uses: actions/checkout@v6.0.2
+
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Set up Terraform with specified version on the runner
+        uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend-config="bucket=$TF_BACKEND_S3_BUCKET"
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'push'
+        run: terraform plan -var-file="dev-terraform.tfvars" -no-color -out=TFplan.JSON
+        continue-on-error: true
+
+      - name: Terraform Apply
+        id: apply
+        # Apply only on push events, not on PRs
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -var-file="dev-terraform.tfvars" -auto-approve -input=false
+
+      - name: Sync HTML source files to S3
+        id: sync
+        if: steps.apply.outcome == 'success'
+        run: |
+          aws s3 sync webfiles/ s3://${{ env.WEBSITE_BUCKET_NAME }}/ \
+            --delete \
+            --cache-control "public, max-age=86400" \
+            --metadata-directive REPLACE
+
+      - name: Invalidate CloudFront cache
+        id: invalidation
+        if: steps.sync.outcome == 'success'
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ env.DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      - name: Content deployment summary
+        id: summary
+        if: steps.sync.outcome == 'success'
+        run: |
+          echo "✅ Content deployed successfully!"
+          echo "📁 Bucket: ${{ env.WEBSITE_BUCKET_NAME }}"
+          echo "🌐 Distribution: ${{ env.DISTRIBUTION_ID }}"
+          echo "🔄 Cache invalidated for all paths"
+
+      - name: PR validation summary
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "✅ Content validation passed!"
+          echo "📝 Ready for deployment when merged to main"
