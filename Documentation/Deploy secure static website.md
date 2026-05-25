@@ -1281,3 +1281,7 @@ deployment through GitHub Actions.
 
 _If you have a static site idea — a portfolio, documentation, a landing page — and were wondering how to host it on AWS
 with proper security and automation, **this project has the blueprint**._
+
+---
+
+_Project by Darvin | Deploy Secure Static Website_
