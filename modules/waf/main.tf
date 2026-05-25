@@ -25,7 +25,7 @@ resource "aws_wafv2_web_acl" "main" {
         rule_action_override {
           name = "SizeRestrictions_BODY"
           action_to_use {
-            allow {}
+            count {}
           }
         }
       }
@@ -241,7 +241,7 @@ resource "aws_wafv2_web_acl" "main" {
         vendor_name = "AWS"
         rule_action_override {
           action_to_use {
-            allow {}
+            count {}
           }
           name = "WindowsShellCommands_BODY"
         }

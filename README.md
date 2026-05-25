@@ -1,4 +1,4 @@
-## Deploy secure, low-latency static website with DNSSEC for amazon Route 53 + CloudFront + WAF + Encryption(SSL/TLS) using Terraform
+## Deploy secure, low-latency static website with DNSSEC for Amazon Route 53 + CloudFront + WAF + Encryption(SSL/TLS) using Terraform
 
 This Terraform project creates a production-ready AWS CloudFront distribution using modern AWS practices including
 Origin Access Control (OAC), cache policies, and modular architecture.
@@ -195,7 +195,6 @@ s3-static-website/
    ├── .github/workflows/
       ├── website-deployment.yml    # Static Website deployment workflows
       ├── terraform-checkov.yml     # Checkov workflows
-      ├── terraform-infracost.yml   # Infracost workflows
 ```
 
 **Step 2: Modules implementation**
