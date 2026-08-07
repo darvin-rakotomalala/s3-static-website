@@ -77,7 +77,7 @@ This solution consists of three dependent steps:
 - **Step 3** handles content deployment, updating website content without re-provisioning infrastructure, and
   relies on the infrastructure built in Step 2.
 
-![static website architecture.jpg](../static%20website%20architecture.jpg)
+![static website architecture.png](../static%20website%20architecture.png)
 
 ---
 
@@ -907,8 +907,7 @@ Two IAM policies are attached to the S3 buckets, granting CloudFront permission 
 
 ```
 User → WAF → CloudFront → S3 (website bucket)    [content]
-                       → S3 (ops bucket)          [error pages + logs]
-
+                        → S3 (ops bucket)        [error pages + logs]
 ```
 
 ### Security Layer — AWS WAF
@@ -1057,14 +1056,14 @@ After deployment, you'll get:
 ### Step 4: Deploy Content and Invalidate Cache
 
 The final stage separates content deployment from infrastructure, allowing static website updates without re-running
-Terraform. Static HTML files are in the content folder, and a GitHub Actions workflow (`deploy-infrastructure.yml`)
+Terraform. Static HTML files are in the content folder, and a GitHub Actions workflow (`deploy.yml`)
 automates deployment on every merge to the main branch.
 
 ### Workflow GitHub Actions
 
-- **`terraform-checkov.yml`** — Automated security scanning framework using Checkov to detect Terraform
+- **`checkov.yml`** — Automated security scanning framework using Checkov to detect Terraform
   misconfigurations at both repository and pull request (PR) levels.
-- **`deploy-infrastructure.yml`** — Terraform workflow to provision infrastructure and deploy the Static Website with
+- **`deploy.yml`** — Terraform workflow to provision infrastructure and deploy the Static Website with
   OIDC, synchronize Website content if something changed, and invalidate a CloudFront cache, forcing edge servers to
   fetch fresh content from the origin.
 

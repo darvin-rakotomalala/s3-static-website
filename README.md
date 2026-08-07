@@ -1,4 +1,4 @@
-## Deploy secure, low-latency static website with DNSSEC for Amazon Route 53 + CloudFront + WAF + Encryption(SSL/TLS) using Terraform
+## Deploy secure, low-latency static website with DNSSEC for Amazon Route 53 + CloudFront + WAF + Encryption (SSL/TLS) using Terraform
 
 This Terraform project creates a production-ready AWS CloudFront distribution using modern AWS practices including
 Origin Access Control (OAC), cache policies, and modular architecture.
@@ -13,25 +13,51 @@ end-to-end encryption with customer-managed KMS keys, DNSSEC for DNS integrity, 
 deployment process is fully automated through GitHub Actions workflows with OIDC authentication, eliminating the need
 for long-lived credentials.
 
+### Business Problem
+
+***
+
+Organizations need a globally accessible, high-performance static website (such as marketing sites, documentation
+portals, or public landing pages) that can maintain high availability and ultra-low latency for users worldwide without
+incurring the overhead of managing web servers. At the same time, businesses must protect their brand reputation,
+prevent unauthorized data access, defend against web-based cyber threats, and comply with modern security standards—all
+while keeping operational costs low and infrastructure management automated.
+
+### Key Challenges
+
+***
+
+- **Security & Vulnerability Risks**: Publicly exposing S3 buckets directly to the web opens origins to unauthorized
+  access, while unencrypted DNS traffic creates exposure to DNS spoofing and man-in-the-middle (MitM) attacks.
+  Furthermore, web applications without firewall protection are continuously vulnerable to DDoS attacks, rate abuse, and
+  common web threats.
+- **Performance & Latency Gaps**: Serving static content directly from a single storage region leads to high latency for
+  global end-users and poor caching performance if headers and invalidations aren't properly managed.
+- **Operational & Credentials Overhead**: Managing credentials for CI/CD pipelines with long-lived IAM keys poses a
+  significant security risk, and provisioning complex, multi-service cloud architecture manually leads to configuration
+  drift, human error, and deployment bottlenecks.
+- **Observability & Resilience**: Lack of granular monitoring makes it difficult to detect origin failures, elevated
+  error rates (4xx/5xx), or improper access patterns before they impact real users.
+
 ### Architecture Overview
 
 ***
 
-![static website architecture.jpg](static%20website%20architecture.jpg)
+![static website architecture.png](static%20website%20architecture.png)
 
 The project uses the following AWS services:
 
-- CloudFront Distribution with custom domain and SSL using modular approach
-- Amazon S3 — Two private buckets: one for website content, one for error pages and CloudFront access logs
-- Modern Security: OAC (not legacy OAI), WAF with managed rules, optional Shield Advanced
+- **CloudFront Distribution** with custom domain and SSL using modular approach
+- **Amazon S3** — Two private buckets: one for website content, one for error pages and CloudFront access logs
+- **Modern Security**: OAC (not legacy OAI), WAF with managed rules, optional Shield Advanced
 - Cache Policies: Modern caching approach replacing forwarded_values
-- DNS Management: Route53 hosted zone with domain records
-- Amazon Route 53 — Hosted zone with A records (root + www) and DNSSEC enabled
-- Amazon CloudFront — CDN distribution with Origin Access Control (OAC), HTTPS redirect, custom error pages, and access
-  logging
-- AWS Certificate Manager (ACM) — SSL/TLS certificate with DNS validation
-- AWS KMS — Encryption keys for S3 buckets, SSM parameters, and DNSSEC signing
-- Monitoring: CloudWatch dashboard and comprehensive alarms
+- **DNS Management**: Route53 hosted zone with domain records
+- **Amazon Route 53** — Hosted zone with A records (root + www) and DNSSEC enabled
+- **Amazon CloudFront** — CDN distribution with Origin Access Control (OAC), HTTPS redirect, custom error pages, and
+  access logging
+- **AWS Certificate Manager (ACM)** — SSL/TLS certificate with DNS validation
+- **AWS KMS** — Encryption keys for S3 buckets, SSM parameters, and DNSSEC signing
+- **Monitoring**: CloudWatch dashboard and comprehensive alarms
 
 ### Key Modern Features
 
@@ -139,46 +165,46 @@ s3-static-website/
 ├── error-pages                     # HTML file for custom error page
 └── modules/
     └── acm/                        # This module sets up an ACM for certificate
-          ├── main.tf
-          ├── outputs.tf
-          └── variables.tf
+        ├── main.tf
+        ├── outputs.tf
+        └── variables.tf
     └── bootstrap/                  # This module sets up a backend for Terraform state file
-          ├── main.tf
-          ├── outputs.tf
-          └── variables.tf
+        ├── main.tf
+        ├── outputs.tf
+        └── variables.tf
     └── cloudfront/                 # This module creates a CloudFront for CDN
-          ├── main.tf
-          ├── outputs.tf
-          └── variables.tf
+        ├── main.tf
+        ├── outputs.tf
+        └── variables.tf
     └── cloudwatch/                 # This module creates a monitoring for CloudFront
-          ├── main.tf               
-          ├── outputs.tf          
-          └── variables.tf         
+        ├── main.tf               
+        ├── outputs.tf          
+        └── variables.tf         
     └── iam/                        # This module creates an IAM for this project
-          ├── ga-oidc.tf            # This code sets up IAM role Terraform execution ARN for GitHub Actions CI/CD using OIDC (OpenID Connect)
-          ├── outputs.tf
-          └── variables.tf
+        ├── ga-oidc.tf              # This code sets up IAM role Terraform execution ARN for GitHub Actions CI/CD using OIDC (OpenID Connect)
+        ├── outputs.tf
+        └── variables.tf
     └── kms/                        # This module sets up a KMS encryption for S3 bucket
-          ├── main.tf
-          ├── outputs.tf
-          └── variables.tf
+        ├── main.tf
+        ├── outputs.tf
+        └── variables.tf
     └── route53/                    # This module sets up an Amazon Route 53 for DNS and DNSSEC signing
-          ├── main.tf
-          ├── outputs.tf
-          └── variables.tf
+        ├── main.tf
+        ├── outputs.tf
+        └── variables.tf
     └── s3/                         # This module sets up a private S3 for HTML files and custom error pages + log
-          ├── outputs.tf
-          ├── s3-logging.tf
-          ├── s3-website.tf
-          └── variables.tf
+        ├── outputs.tf
+        ├── s3-logging.tf
+        ├── s3-website.tf
+        └── variables.tf
     └── sns/                        # This module sets up an SNS notification system for alert
-          ├── main.tf
-          ├── outputs.tf
-          └── variables.tf
+        ├── main.tf
+        ├── outputs.tf
+        └── variables.tf
     └── waf/                        # This module sets up a AWS WAF
-          ├── main.tf
-          ├── outputs.tf
-          └── variables.tf
+        ├── main.tf
+        ├── outputs.tf
+        └── variables.tf
    ├── Screenshot verification      # Screenshot verification after success deployement
    ├── webfiles                     # Static HTML Files
    ├── .gitignore                   # gitignore
@@ -197,22 +223,28 @@ s3-static-website/
       ├── terraform-checkov.yml     # Checkov workflows
 ```
 
-**Step 2: Modules implementation**
+**Step 2: Modules implemented**
 
-- Module "bootstrap"
-- Module "iam"
-- Module "route53"
-- Module "acm"
-- Module "kms"
-- Module "s3"
-- Module "cloudfront"
-- Module "waf"
+- **bootstrap** — This code sets up the remote state backend infrastructure for Terraform itself — it's the "bootstrap"
+  you run once before using remote state.
+- **iam** — This code sets up GitHub Actions CI/CD authentication to AWS using OIDC (OpenID Connect) — a keyless,
+  token-based auth method. No long-lived AWS credentials stored in GitHub secrets.
+- **route53** — This code sets up DNS hosting and DNSSEC security for a domain on AWS.
+- **acm** — This code provisions and validates an SSL/TLS certificate for a website using AWS Certificate Manager (ACM)
+  and Route 53. It has three resources that work together in sequence.
+- **kms** — This code sets up an AWS KMS (Key Management Service) encryption key for securing S3 bucket data.
+- **s3** — This code provisions a secure, production-grade S3 bucket designed to host a static website (HTML, CSS, JS,
+  images) behind CloudFront.
+- **cloudfront** — This module sets up a CloudFront CDN distribution for a static website hosted on S3, with security,
+  caching, and access control configurations.
+- **waf** — This module sets up a Web Application Firewall (WAF) for a CloudFront distribution on AWS.
 - Upload HTML files to S3 bucket
 - Upload error pages
-- Module "cloudwatch"
-- Module "sns"
+- **cloudwatch** — This module sets up AWS CloudWatch monitoring for a CloudFront distribution.
+- **sns** — This module sets up an AWS SNS (Simple Notification Service) notification system for CloudFront alerts.
 
-**Step 3: Outputs**<br>
+**Step 3: Outputs**
+
 After deployment, you'll get:
 
 - Website URLs (https://cloudwithdarvin.com)
@@ -222,11 +254,11 @@ After deployment, you'll get:
 
 **Step 4: Deployment Workflow**
 
-- ```terraform-checkov.yml``` — Automated security scanning framework using Checkov to detect Terraform
-  misconfigurations at both repository and pull request (PR) levels.
-- ```deploy-infrastructure.yml``` — Terraform workflow to provision infrastructure and deploy Static Website with OIDC,
-  synchronize Website content if something changed and invalidates a CloudFront cache, forcing edge servers to fetch
-  fresh content from the origin.
+- ```checkov.yml``` — Automated security scanning framework using Checkov to detect Terraform misconfigurations at both
+  repository and pull request (PR) levels.
+- ```deploy.yml``` — Terraform workflow to provision infrastructure and deploy Static Website with OIDC, synchronize
+  Website content if something changed and invalidates a CloudFront cache, forcing edge servers to fetch fresh content
+  from the origin.
 
 ### Quick Start
 
@@ -281,8 +313,8 @@ You can check the full documentation in ```Documentation``` directory and all sc
 
 ![6-cf-distribution error pages.png](Screenshot%20verification/6-cf-distribution%20error%20pages.png)
 
-- The Route 53 hosted zone shows the A records (```root``` and ```www```) aliased to CloudFront, the NS and SOA records, and the
-  CNAME records created during ACM DNS validation.
+- The Route 53 hosted zone shows the A records (```root``` and ```www```) aliased to CloudFront, the NS and SOA records,
+  and the CNAME records created during ACM DNS validation.
 
 ![2-Route 53.png](Screenshot%20verification/2-Route%2053.png)
 
