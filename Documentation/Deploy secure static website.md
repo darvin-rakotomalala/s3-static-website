@@ -1,1231 +1,689 @@
-## Deploy secure, low-latency static website with DNSSEC for Amazon Route 53 + CloudFront + WAF + Encryption (SSL/TLS) using Terraform
+# Secure, Low-Latency Static Website on AWS with Terraform
+
+**Route 53 (DNSSEC) · CloudFront · WAF · ACM (TLS) · KMS · S3 · GitHub Actions (OIDC)**
+
+A production-grade, fully serverless static website hosted on AWS and provisioned entirely with Terraform. Traffic is
+protected end to end: signed DNS, TLS in transit, KMS encryption at rest, a web application firewall at the edge, and
+private origins reachable only through CloudFront.
 
 ---
 
-## Table of Contents
+## 1. Overview
 
-- [Project Overview](#project-overview)
-- [The Challenge](#the-challenge)
-- [Solution Overview](#solution-overview)
-- [Architecture Overview](#architecture-overview)
-- [Tech Stack](#tech-stack)
-- [Traffic Flow](#traffic-flow)
-- [Key Features](#key-features)
-- [Prerequisites](#prerequisites)
-- [Implementation](#implementation)
-    - [Required AWS Permissions](#required-aws-permissions)
-    - [Project Structure](#project-structure)
-    - [Required GitHub Secrets](#required-github-secrets)
-- [Step 1 – Remote State Backend & OIDC CI/CD Authentication](#step-1--remote-state-backend-infrastructure-and-github-actions-cicd-authentication-using-oidc)
-- [Step 2 – Provision the Route 53 Hosted Zone](#step-2-provision-the-route-53-hosted-zone)
-- [Step 3 – Deploy S3 Buckets, CloudFront Distribution & SSL Certificate](#step-3-deploy-s3-buckets-cloudfront-distribution-and-ssl-certificate)
-- [Step 4 – Deploy Content and Invalidate Cache](#step-4-deploy-content-and-invalidate-cache)
-- [Monitoring](#monitoring)
-- [Quick Start](#quick-start)
-- [Verification](#verification)
-- [Troubleshooting](#troubleshooting)
-- [Conclusion](#conclusion)
+### The challenge
 
----
+Hosting a static site on a traditional server means patching the OS, configuring a web server, renewing certificates,
+and scaling capacity. None of this adds value for static content.
 
-## Project Overview
+### The solution
 
-This Terraform project demonstrates how to deploy a secure static website on AWS using Terraform with Amazon S3,
-CloudFront, Route 53, AWS Certificate Manager (ACM), AWS KMS, and AWS WAF.
+This project replaces that overhead with managed AWS services:
 
-AWS offers flexible pricing options of Content Delivery Network (CDN) with CloudFront, providing easy deployment options
-to start. If you are accessing any enterprise-level website or watching videos, you are accessing content from a CDN.
-CDN can not only help by adding caching, but also provides options to increase security, improve high availability, and
-save bandwidth on your origin servers. This is where Amazon CloudFront becomes your secret weapon — it's not just
-another AWS service; it's the difference between a sluggish website and a lightning-fast user experience that keeps
-customers coming back.
+| Role                                    | Service                            |
+|-----------------------------------------|------------------------------------|
+| **Store** website files                 | Amazon S3 (private, KMS-encrypted) |
+| **Cache and serve** globally over HTTPS | Amazon CloudFront                  |
+| **Route** the custom domain             | Amazon Route 53 (DNSSEC-signed)    |
+| **Issue** TLS certificates              | AWS Certificate Manager (ACM)      |
+| **Protect** against web attacks         | AWS WAF                            |
+| **Encrypt** data and sign DNS           | AWS KMS                            |
+| **Observe** and alert                   | CloudWatch, SNS                    |
+
+The result is a serverless, highly available pattern with no EC2 instances to manage, secured at every layer.
 
 ---
 
-## The Challenge
+## 2. Architecture
 
-**Hosting static websites** on traditional servers requires managing OS patches, web server configuration, SSL renewal,
-and scaling — tasks that add no value for static content. **Amazon S3**, **CloudFront**, and **Route 53** remove this
-overhead while providing global CDN distribution, managed SSL, and DNS.
+![Static website architecture](../static%20website%20architecture.png)
 
----
+### 2.1 Request flow
 
-## Solution Overview
+```mermaid
+flowchart LR
+    U[User] -->|1 . DNS lookup| R53["Route 53<br/>(DNSSEC)"]
+    U -->|2 . HTTPS, TLS 1 . 2+| CF["CloudFront<br/>+ WAF + ACM certificate"]
+    CF -->|3 . SigV4 via OAC| S3W[("S3 website bucket<br/>SSE-KMS")]
+    CF -->|error pages / logs| S3O[("S3 ops bucket<br/>SSE-KMS")]
+    CF -.->|metrics| CW[CloudWatch]
+    CW -.->|alarms| SNS[SNS email alerts]
+    KMS[AWS KMS] -.->|signing key| R53
+    KMS -.->|encryption keys| S3W
+    KMS -.->|encryption keys| S3O
+```
 
-This Terraform project demonstrates production-ready AWS CloudFront distribution using modern AWS practices. The
-solution implements a three-steps deployment architecture that DNS management, infrastructure provisioning,
-and content deployment for better maintainability and security.
+1. **DNS resolution.** The browser asks Route 53, which answers through an alias A record. DNS responses are signed with
+   a KMS-backed DNSSEC key to prevent spoofing and cache poisoning.
+2. **Content delivery.** The request reaches CloudFront over HTTPS, using an ACM certificate. AWS WAF (attached to the
+   distribution as a Web ACL) inspects the request at the edge before it is processed.
+3. **Origin fetch.** On a cache miss, CloudFront retrieves the object from the private website bucket using Origin
+   Access Control (OAC) with SigV4 signing. Custom error pages come from the ops bucket, which also receives access
+   logs.
 
-In this project:
+### 2.2 Security layers
 
-- **Amazon S3** is used to **store** website files
-- **Amazon CloudFront** is used to **cache** and **serve** them globally over HTTPS
-- **Amazon Route 53** is used to **route** the custom domain to CloudFront
+| Layer              | Service                      | Purpose                                             |
+|--------------------|------------------------------|-----------------------------------------------------|
+| DNS integrity      | Route 53 + KMS               | DNSSEC signing                                      |
+| Transport          | ACM + CloudFront             | HTTPS only, TLS 1.2 minimum, HTTP to HTTPS redirect |
+| Edge protection    | AWS WAF                      | Managed rules, rate limiting, bot control           |
+| Origin protection  | OAC + bucket policies        | S3 reachable only through CloudFront                |
+| Browser protection | Response headers policy      | HSTS, X-Frame-Options, nosniff, Referrer-Policy     |
+| Encryption at rest | KMS                          | Customer-managed keys for both buckets              |
+| Observability      | CloudWatch, SNS, access logs | Metrics, alarms, audit trail                        |
+| Access control     | IAM + GitHub OIDC            | Least privilege, no long-lived credentials          |
 
-Together, they form a complete static hosting platform. The setup also includes **ACM** for SSL certificates, **AWS KMS
-** encryption for storage, **AWS WAF** to protect against attacks, and **DNSSEC** for DNS security.
+### 2.3 Deployment architecture
 
----
+The project is deployed in four dependent phases, each with its own Terraform state so DNS, infrastructure, and content
+can change independently.
 
-## Architecture Overview
+```mermaid
+flowchart TD
+    P0["Phase 0: Bootstrap<br/>State bucket, lock table, OIDC role"] --> P1
+    P1["Phase 1: DNS<br/>Hosted zone + DNSSEC"] --> P2
+    P2["Phase 2: Infrastructure<br/>ACM, KMS, S3, CloudFront, WAF, monitoring"] --> P3
+    P3["Phase 3: Content<br/>Sync files + invalidate cache"]
+```
 
-This solution consists of three dependent steps:
+### 2.4 Tech stack
 
-- **Step 1** provisions the Route 53 hosted zone and enables DNSSEC.
-- **Step 2** deploys the S3 buckets, CloudFront distribution, SSL certificate, and enables WAF to protect against
-  attacks — using the hosted zone from **Step 1** for DNS validation.
-- **Step 3** handles content deployment, updating website content without re-provisioning infrastructure, and
-  relies on the infrastructure built in Step 2.
-
-![static website architecture.png](../static%20website%20architecture.png)
-
----
-
-## Tech Stack
-
-The solution uses the following AWS services:
-
-| Service                           | Description                                                                                               |
-|-----------------------------------|-----------------------------------------------------------------------------------------------------------|
-| **Amazon Route 53**               | Hosted zone with A records (root + www) and DNSSEC enabled                                                |
-| **Amazon CloudFront**             | CDN distribution with Origin Access Control (OAC), HTTPS redirect, custom error pages, and access logging |
-| **Amazon S3**                     | Two private buckets: one for website content, one for error pages and CloudFront access logs              |
-| **AWS Certificate Manager (ACM)** | SSL/TLS certificate with DNS validation                                                                   |
-| **AWS KMS**                       | Encryption keys for S3 buckets, SSM parameters, and DNSSEC signing                                        |
-| **AWS WAF**                       | Enable WAF to protect against attacks                                                                     |
-
----
-
-## Traffic Flow
-
-This diagram shows a secure, scalable static website hosting setup on AWS. Here's how it flows:
-
-1. User → Route53 → CloudFront (HTTPS / TLS 1.2/1.3)
-2. CloudFront → WAF → S3 (HTTPS/TLS 1.2/1.3)
-3. Response → S3 → CloudFront → User
-
-### Request Flow (Steps 1 → 2 → 3)
-
-- **Step 1 — DNS Resolution (Users → Route 53):** Users type a URL in their browser. Amazon Route 53 handles DNS
-  resolution via an **A record (DNS alias)**. Route 53 also uses **AWS KMS** to manage a **DNSSEC signing key**,
-  protecting against DNS spoofing attacks.
-
-- **Step 2 — Content Delivery (Route 53 → CloudFront):** Traffic is routed to **Amazon CloudFront** (the CDN), which:
-
-    - Uses an **SSL/TLS certificate** from AWS Certificate Manager (ACM) for HTTPS
-    - Is monitored by **Amazon CloudWatch** for metrics and alarms
-    - Is protected by **AWS WAF** (Web Application Firewall) via a **Web ACL**, filtering malicious traffic
-    - Sends error pages and access logs to a dedicated **Amazon S3 bucket** (also KMS-encrypted)
-- **Step 3 — Content Storage (CloudFront → S3):** CloudFront fetches static files from a **primary Amazon S3 bucket** (
-  the Website Bucket). The static HTML files are uploaded here by developers/CI pipelines. This bucket is also *
-  *encrypted using AWS KMS**.
-
-### Key Security Layers
-
-| Layer              | Service        | Purpose                  |
-|--------------------|----------------|--------------------------|
-| DNS Security       | KMS + Route 53 | DNSSEC protection        |
-| Transport          | ACM            | HTTPS/TLS certificates   |
-| Edge Protection    | AWS WAF        | Block malicious requests |
-| Storage Encryption | AWS KMS        | Encrypt both S3 buckets  |
-| Observability      | CloudWatch     | Monitor & alert          |
-
-### SSL/TLS for Data in Transit
-
-- HTTPS (TLS 1.2/1.3) between User ↔ CloudFront
-- TLS 1.2/1.3 between CloudFront ↔ S3
-
-### Amazon CloudFront (CDN)
-
-- Global Edge Locations
-- Caching (Images, CSS, JS, Articles)
-- DDoS Protection (Edge)
-- HTTPS (TLS 1.2/1.3)
-
-### AWS WAF (Web Application Firewall)
-
-- OWASP Top 10 Protection
-- SQL Injection Protection
-- XSS Protection
-- IP Rate Limiting
-- Geo Blocking
-- Bot Control
-
-### Amazon S3 (Encrypted)
-
-- SSE-S3 / SSE-KMS (AES-256)
-- Encryption Keys managed by AWS KMS
-
-### AWS Certificate Manager (ACM)
-
-- SSL/TLS Certificates from AWS Certificate Manager (ACM)
-- Used by CloudFront
-- Enforces HTTPS (443)
-- Supports TLS 1.2 and TLS 1.3
-
-### Security Highlights
-
-- Only HTTPS (443) allowed
-- WAF protects from common attacks
-- All data in transit encrypted (TLS)
-- All data at rest encrypted
-- Least privilege access
-- Centralized key management (KMS)
-
-### Monitoring & Supporting Services
-
-- Amazon CloudWatch (Monitoring & Logs)
-- AWS CloudTrail (Audit Logs)
-
-### Key Management — AWS KMS (Keys Encrypted & Rotated)
-
-This is a well-architected, **serverless** static hosting pattern — no EC2 instances needed, highly available by
-default, and secure end-to-end.
+| Service                     | Role in this project                                                 |
+|-----------------------------|----------------------------------------------------------------------|
+| **Amazon Route 53**         | Hosted zone, alias A records (root and `www`), DNSSEC                |
+| **Amazon CloudFront**       | CDN with OAC, HTTPS redirect, custom error pages, access logging     |
+| **Amazon S3**               | Two private buckets: website content, and ops (error pages and logs) |
+| **AWS Certificate Manager** | TLS certificate with DNS validation                                  |
+| **AWS KMS**                 | Keys for S3 encryption and DNSSEC signing                            |
+| **AWS WAF**                 | Web ACL with managed and custom rules                                |
+| **Amazon CloudWatch / SNS** | Dashboard, alarms, email notifications                               |
+| **GitHub Actions**          | CI/CD with OIDC, Checkov scanning, Infracost estimates               |
 
 ---
 
-## Key Features
+## 3. Features
 
-### Three-Stage Deployment Architecture
+**Security**
 
-- Isolated DNS, infrastructure, and content deployment workflows
-- Deploys the S3 buckets, CloudFront distribution, SSL certificate, and WAF
-- Independent state management for each deployment layer
-
-### Enterprise-Grade Security
-
-- Private S3 buckets with Origin Access Control (OAC) and SigV4 signing
-- End-to-end encryption: KMS keys for S3, SSM parameters, and DNSSEC signing
+- Private S3 buckets accessed only through CloudFront (OAC with SigV4)
+- Customer-managed KMS keys for S3 with automatic rotation
+- DNSSEC-enabled hosted zone
 - TLS 1.2 minimum with automatic HTTPS redirect
-- DNSSEC-enabled Route 53 hosted zone for DNS integrity
-- OIDC authentication for GitHub Actions (no long-lived credentials)
-- AWS Web Application Firewall (WAF) to protect against attacks
+- AWS WAF with managed rule sets, rate limiting, and bot control
+- Security response headers (HSTS, X-Frame-Options, and more)
+- Keyless GitHub Actions authentication through OIDC
 
-### Production-Ready Features
+**Reliability and operations**
 
-- Global content delivery via CloudFront CDN
-- Custom error pages (404/500) with dedicated S3 bucket
-- CloudFront and S3 access logging for audit trails
+- Global delivery through CloudFront edge locations
+- Custom 404/500 error pages served from a dedicated bucket
+- CloudFront, S3, and WAF logging for audit trails
+- S3 versioning with 90-day retention of noncurrent versions for rollback
 - Automated cache invalidation on content updates
-- S3 versioning with 90-day retention for rollback capability
-- AWS WAF to filter malicious requests and provide protection from intruders
-- Monitoring via AWS CloudWatch service to create dashboards and alarms in case of errors and performance issues
+- CloudWatch dashboard and alarms with SNS email alerts
 
-### Cost & Compliance
+**Engineering practices**
 
-- **Infracost** integration for infrastructure cost estimation
-- **Checkov** security scanning in CI/CD pipeline
-- Automated deployment reduces manual errors and operational overhead
-- To improve performance, enable compression and also enable it for images in the terraform module. Optimize cache key
-  by including only required headers, cookies, and query strings.
-- For cost optimization, select the correct price class. Allow only geographic regions where you want to allow users to
-  access the application. Use different TTL for static and dynamic content. Use primary and secondary origins to
-  increase availability. Use cache invalidation carefully.
-
-### Modular Architecture
-
-- Reusable Terraform modules
-- Clean separation of concerns
-- Easy to maintain and extend
-- Production-ready structure
+- Reusable, single-purpose Terraform modules
+- Independent state per deployment layer
+- Checkov security scanning and Infracost cost estimates in CI/CD
+- Separate variable files for `dev`, `staging`, and `prod`
 
 ---
 
-## Prerequisites
+## 4. Prerequisites
 
-- An AWS account with an IAM role configured for GitHub Actions via OIDC. This eliminates long-lived credentials.
-- An Amazon S3 bucket for Terraform remote state.
-- **Register domain through Route 53:** This is a pre-requisite before running Terraform code. You can buy a domain from
-  an external DNS provider or buy from the Route53 DNS request option.
-- You have to use your name domain as part of the Route 53 zone.
+### Tools
 
----
+| Tool      | Version                                      |
+|-----------|----------------------------------------------|
+| AWS CLI   | v2 or later, configured with `aws configure` |
+| Terraform | >= 1.14.8                                    |
+| Git       | Any recent version                           |
 
-## Implementation
+### Accounts and resources
 
-### Prerequisites
+- **AWS account** with permissions to create Route 53, S3, CloudFront, ACM, KMS, WAF, CloudWatch, SNS, and IAM
+  resources.
+- **A domain name.** It can be registered with Route 53 or an external registrar (this project used Squarespace). You
+  must be able to change its nameservers and, for DNSSEC, add a DS record at the registrar.
+- **GitHub OIDC trust.** An OpenID Connect identity provider in IAM with a trust relationship to your GitHub repository,
+  plus an IAM role the workflows can assume.
+- **Remote state bucket.** An S3 bucket for Terraform state. Update the bucket name in the `bootstrap` module and in
+  `backend.tf`.
 
-- AWS CLI v2+ configured with `aws configure` and with appropriate permissions
-- Terraform \>= 1.14.8 installed
-- Domain registered through Route 53 (creates hosted zone automatically)
-
-### Required AWS Permissions
-
-Your AWS user/role needs permissions for:
-
-- A registered domain with access to change its nameservers at your domain registrar
-- Ensure the IAM role has permissions to create and manage all resources including Route 53, S3, CloudFront, ACM, KMS,
-  and WAF
-- CloudWatch (dashboard and metrics access)
-- For this code to function without errors, create an OpenID Connect identity provider in Amazon Identity and Access
-  Management that has a trust relationship with this GitHub repository.
-- Store the ARN of the IAM Role as a GitHub secret named `AWS_ROLE_ARN` which is referenced in the workflow files.
-- An S3 bucket for Terraform remote state — update the bucket value in `bootstrap/` module and `backend.tf`.
-
-### Project Structure
-
-```
-s3-static-website/
-├── Documentation          # Documentation of this project and AWS services study note
-├── error-pages            # HTML file for custom error page
-└── modules/
-    ├── acm/               # This module sets up an ACM for certificate
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    ├── bootstrap/         # This module sets up a backend for Terraform state file
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    ├── cloudfront/        # This module creates a CloudFront for CDN
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    ├── cloudwatch/        # This module creates a monitoring for CloudFront
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    ├── iam/               # This module creates an IAM for this project
-    │   ├── ga-oidc.tf     # This code sets up IAM role Terraform execution ARN for CI/CD
-    │   ├── outputs.tf
-    │   └── variables.tf
-    ├── kms/               # This module sets up a KMS encryption for S3 bucket
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    ├── route53/           # This module sets up an Amazon Route 53 for DNS and DNSSEC signing
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    ├── s3/                # This module sets up a private S3 for HTML files and custom error pages + log
-    │   ├── outputs.tf
-    │   ├── s3-logging.tf
-    │   ├── s3-website.tf
-    │   └── variables.tf
-    ├── sns/               # This module sets up an SNS notification system for alert
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    └── waf/               # This module sets up an AWS WAF
-        ├── main.tf
-        ├── outputs.tf
-        └── variables.tf
-├── Screenshot verification    # Screenshot verification after success deployment
-├── webfiles                   # Static HTML Files
-├── .gitignore                 # gitignore
-├── backend.tf                 # Backend configuration for Terraform state file
-├── data.tf                    # Data sources
-├── locals.tf                  # locals for common_tags
-├── main.tf                    # Main infrastructure resources
-├── outputs.tf                 # Output values
-├── dev-terraform.tfvars       # The terraform.tfvars file for dev
-├── staging-terraform.tfvars   # The terraform.tfvars file for staging
-├── prod-terraform.tfvars      # The terraform.tfvars file for prod
-├── providers.tf               # Terraform and AWS provider configuration
-├── variables.tf               # Input variables and defaults
-└── .github/workflows/
-    ├── website-deployment.yml     # Static Website deployment workflows
-    ├── terraform-checkov.yml      # Checkov workflows
-    └── terraform-infracost.yml    # Infracost workflows
-
-```
-
-### Required GitHub Secrets
+### Required GitHub secrets
 
 Go to **Settings → Secrets and variables → Actions** in your fork:
 
-| Secret                 | Description                  |
-|------------------------|------------------------------|
-| `AWS_REGION`           | `us-east-1`                  |
-| `AWS_ROLE_ARN`         | Your github-actions-role ARN |
-| `TF_BACKEND_S3_BUCKET` | Your state bucket name       |
-| `TF_VERSION`           | `1.14.8`                     |
+| Secret                 | Description                                             | Example                                              |
+|------------------------|---------------------------------------------------------|------------------------------------------------------|
+| `AWS_REGION`           | Deployment region (must be `us-east-1`, see note below) | `us-east-1`                                          |
+| `AWS_ROLE_ARN`         | ARN of the IAM role assumed through OIDC                | `arn:aws:iam::<account-id>:role/github-actions-role` |
+| `TF_BACKEND_S3_BUCKET` | Name of the Terraform state bucket                      | `my-tf-state-bucket`                                 |
+| `TF_VERSION`           | Terraform version used by workflows                     | `1.14.8`                                             |
+
+> **Why `us-east-1`?** CloudFront only accepts ACM certificates from `us-east-1`, WAF web ACLs scoped to CloudFront must
+> be created there, DNSSEC signing keys for Route 53 must live there, and CloudFront metrics are published only to that
+> region.
 
 ---
 
-### Step 1: Remote State Backend Infrastructure and GitHub Actions CI/CD Authentication using OIDC
-
-### Module "bootstrap"
-
-This code sets up the **remote state backend infrastructure** for Terraform itself — it's the "bootstrap" you run once
-before using remote state.
-
-#### The Problem It Solves
-
-By default, Terraform stores its state file locally. In a team or CI/CD environment you need that state stored remotely
-and protected. This code creates that remote storage on AWS.
-
-#### Resource by Resource
-
-1. **`aws_s3_bucket.terraform_state`** — Creates the S3 bucket that will store your `.tfstate` files.
-
-2. **`aws_s3_bucket_versioning.terraform_state`** — Enables **versioning** on the bucket.
-
-    - Every time Terraform writes a new state, the old one is preserved as a previous version
-    - This lets you **roll back** to any prior state if something goes wrong
-3. **`aws_s3_bucket_server_side_encryption_configuration.terraform_state`** — Encrypts everything in the bucket at rest
-   using **AWS KMS**.
-
-    - State files often contain sensitive values (passwords, keys, IPs), so encryption is critical
-    - `aws:kms` uses AWS-managed keys by default (you can swap in a customer-managed key)
-4. **`aws_s3_bucket_public_access_block.terraform_state`** — Blocks all public access to the bucket — all four settings
-   set to `true`.
-
-    - Prevents accidental public exposure of your state file
-    - Acts as a hard override even if someone tries to add a public bucket policy later
-5. **`aws_dynamodb_table.terraform_locks`** — Creates a DynamoDB table for **state locking**.
-
-    - When Terraform runs, it writes a LockID entry to this table
-    - If two people (or two CI jobs) run `terraform apply` simultaneously, the second one sees the lock and waits or
-      errors — preventing **state corruption**
-    - `PAY_PER_REQUEST` means no capacity planning needed; you only pay per lock/unlock operation
-
-#### How They Work Together
+## 5. Repository Structure
 
 ```
-terraform apply
-      │
-      ▼
-Reads state ◄── S3 bucket (versioned + encrypted + private)
-      │
-      ▼
-Acquires lock ──► DynamoDB table (LockID)
-      │
-      ▼
-Makes changes
-      │
-      ▼
-Writes new state ──► S3 bucket
-      │
-      ▼
-Releases lock ──► DynamoDB (deletes LockID row)
-
+s3-static-website/
+├── .github/workflows/
+│   ├── website-deployment.yml      # Infrastructure + content deployment (OIDC)
+│   ├── terraform-checkov.yml       # Security scanning
+│   └── terraform-infracost.yml     # Cost estimation
+├── modules/
+│   ├── acm/            # TLS certificate and DNS validation
+│   ├── bootstrap/      # Terraform remote state backend
+│   ├── cloudfront/     # CDN, OAC, cache and header policies, bucket policies
+│   ├── cloudwatch/     # Dashboard and alarms
+│   ├── iam/            # GitHub Actions OIDC role (ga-oidc.tf)
+│   ├── kms/            # S3 encryption key
+│   ├── route53/        # Hosted zone, DNSSEC, alias records
+│   ├── s3/             # Website bucket (s3-website.tf) and ops bucket (s3-logging.tf)
+│   ├── sns/            # Alert topic and email subscriptions
+│   └── waf/            # Web ACL and logging
+├── Documentation/              # Project documentation and AWS study notes
+├── error-pages/                # Custom 404/500 pages
+├── webfiles/                   # Static website content
+├── Screenshot verification/    # Post-deployment evidence
+├── backend.tf                  # Remote state configuration
+├── data.tf                     # Data sources
+├── locals.tf                   # Common tags
+├── main.tf                     # Module composition
+├── outputs.tf                  # Output values
+├── providers.tf                # Terraform and provider configuration
+├── variables.tf                # Input variables and defaults
+├── dev-terraform.tfvars        # Environment variables: dev
+├── staging-terraform.tfvars    # Environment variables: staging
+├── prod-terraform.tfvars       # Environment variables: prod
+└── .gitignore
 ```
 
-### Module "iam" — ga-oidc.tf
-
-This code sets up **GitHub Actions CI/CD authentication to AWS** using OIDC (OpenID Connect) — a keyless, token-based
-auth method. No long-lived AWS credentials stored in GitHub secrets.
-
-#### Overall Flow
-
-```
-GitHub Actions job starts
-      │
-      ▼
-GitHub issues a signed OIDC JWT token
-      │
-      ▼
-Workflow calls sts:AssumeRoleWithWebIdentity with that token
-      │
-      ▼
-AWS verifies the token against the registered OIDC provider
-      │
-      ▼
-AWS checks repo/org conditions match
-      │
-      ▼
-AWS returns short-lived credentials (max 1h)
-      │
-      ▼
-Terraform runs with those credentials
-
-```
+Each module follows the same convention: `main.tf`, `variables.tf`, and `outputs.tf` (the `s3` and `iam` modules split
+resources across descriptive files).
 
 ---
 
-### Step 2: Provision the Route 53 Hosted Zone
+## 6. Quick Start
 
-- We provisioned the Route 53 hosted zone, which became the domain's authoritative DNS zone once configured its
-  nameservers at the domain registrar (SquareSpace). We also enabled DNSSEC using an AWS KMS (Key Management System) Key
-  Signing Key to cryptographically protect DNS responses against tampering.
+**1. Clone the repository**
 
-- **DNSSEC (Domain Name System Security Extensions)** is a security protocol that adds cryptographic signatures to DNS
-  records. This ensures that users are connecting to legitimate websites rather than malicious ones. It also helps
-  prevent attacks like DNS spoofing or cache poisoning by verifying the authenticity and integrity of DNS responses.
-
-- **Amazon Route 53** is a scalable and highly available domain name system (DNS) web service that helps route end-user
-  requests to applications hosted on AWS. It supports domain registration, DNS routing, and target health checking to
-  ensure reliable application performance. Route 53 also **supports security features like DNSSEC**. Integrating Amazon
-  Route 53 with DNSSEC **tightens security** to ensure the authenticity of DNS responses.
-
-- **DNSSEC adds digital signatures to DNS records** so that when someone looks up a domain (like amazon.com), they can
-  verify that the DNS info came from the right source and wasn't tampered with. In AWS, this is achieved by: **(i)**
-  creating an asymmetric KMS Key for DNSSEC signing, **(ii)** enabling it for use with Amazon Route53, **(iii)**
-  associating the KMS Key with the Amazon Route53 hosted zone to create a Key Signing Key, **(iv)** activating DNSSEC
-  for the hosted zone, and **(v)** updating the DS records with the domain registrar to link the domain to the DNSSEC
-  chain of trust.
-
-- Here is
-  a [link to a detailed guide from AWS-Docs](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-configuring-dnssec.html)
-  on enabling DNSSEC signing and establishing a chain of trust.
-
-### Module "route53"
-
-This code sets up **DNS hosting and DNSSEC security** for a domain on AWS.
-
-#### 1\. Route 53 Hosted Zone (`aws_route53_zone.main`)
-
-Creates a **DNS zone** for your domain — essentially a container that holds all DNS records for `var.domain_name`.
-
-#### 2\. KMS Key for DNSSEC (`aws_kms_key.dnssec`)
-
-Creates a **cryptographic signing key** used to sign DNS records:
-
-- `ECC_NIST_P256` — an elliptic curve algorithm required by Route 53 for DNSSEC
-- `SIGN_VERIFY` usage — the key can only sign and verify, not encrypt data
-- 7-day deletion window — a safety buffer before the key is permanently destroyed
-- **Must be in us-east-1** — a hard AWS requirement for DNSSEC keys
-
-#### 3\. KMS Alias (`aws_kms_alias.dnssec`)
-
-Creates a **human-readable name** for the KMS key (e.g., `alias/myapp-example-com-dnssec`) so it's easier to identify in
-the AWS console.
-
-#### 4\. KMS Key Policy (`aws_kms_key_policy.dnssec`)
-
-Defines **who can do what** with the signing key.
-
-#### 5\. Key Signing Key (`aws_route53_key_signing_key.main`)
-
-Links the KMS key to your hosted zone as a **Key Signing Key (KSK)** — the actual DNSSEC signing mechanism attached to
-the zone. Set to **ACTIVE** so it immediately starts being used.
-
-#### 6\. Enable DNSSEC (`aws_route53_hosted_zone_dnssec.main`)
-
-**Turns DNSSEC on** for the hosted zone. Once applied, Route 53 will cryptographically sign all DNS responses,
-protecting against DNS spoofing/cache poisoning attacks.
-
-#### 7\. DNS Records (`aws_route53_record.root` + `.www`)
-
-Two **A records** that point your domain to a CloudFront distribution:
-
-- `cloudwithdarvin.com` → CloudFront (root domain)
-- `www.cloudwithdarvin.com` → CloudFront (www subdomain)
-
-Both use **alias records** (AWS-native, free, and auto-updating) rather than plain A records with hardcoded IPs.
-
-#### 8\. Overall Architecture
-
+```bash
+git clone https://github.com/darvin-rakotomalala/s3-static-website
+cd s3-static-website
 ```
-cloudwithdarvin.com (Route 53 Zone)
-      │
-      ├── DNSSEC enabled (KMS key signs all responses)
-      │
-      ├── example.com ──alias──► CloudFront Distribution
-      └── www.example.com ──alias──► CloudFront Distribution
 
+**2. Configure variables**
+
+Edit `dev-terraform.tfvars` with your region, domain name, and default tags. No secrets belong in this file.
+
+**3. Complete Phase 0** (state backend and OIDC role), then add the [GitHub secrets](#required-github-secrets).
+See [Phase 0](#phase-0-remote-state-and-cicd-authentication).
+
+**4. Deploy**
+
+```bash
+terraform init
+terraform fmt -recursive
+terraform validate
+terraform plan -var-file="dev-terraform.tfvars" -out=tfplan
+terraform apply tfplan
 ```
+
+**5. Update your registrar** with the Route 53 nameservers and the DNSSEC DS record
+(see [Phase 1](#phase-1-dns-and-dnssec)).
+
+**6. Verify** the deployment using the [checklist](#9-verification-and-testing).
+
+> Reviewing a saved plan and applying that exact plan file avoids drift between what you approved and what gets applied.
+> The plan file is binary, so use a name such as `tfplan` rather than `.json`.
 
 ---
 
-### Step 3: Deploy S3 Buckets, CloudFront Distribution, and SSL Certificate
+## 7. Deployment Guide
 
-The second stage focuses on creating the remaining infrastructure components.
+### Phase 0: Remote state and CI/CD authentication
 
-### Provision SSL Certificate (ACM + DNS Validation)
+#### Module `bootstrap`: remote state backend
 
-- CloudFront only accepts certificates from `us-east-1`, regardless of where your other infrastructure lives.
-- CloudFront is a global service, but certificates **must be in the us-east-1 region**.
-- For certificate validation, you need to add the CNAME record mentioned in ACM services to prove you own the domain:
-    - **ACM generates validation records** with random values
-    - **You add CNAME records** to your DNS zone
-    - **ACM checks the records** to verify domain ownership
-    - **Certificate becomes valid** once verification succeeds
+Terraform stores state locally by default, which is unsuitable for teams and CI/CD. This module is run **once** to
+create a protected remote backend.
 
-### Module "acm"
+| Resource                                             | Purpose                                                                 |
+|------------------------------------------------------|-------------------------------------------------------------------------|
+| `aws_s3_bucket.terraform_state`                      | Stores the `.tfstate` files                                             |
+| `aws_s3_bucket_versioning`                           | Preserves previous states for rollback                                  |
+| `aws_s3_bucket_server_side_encryption_configuration` | Encrypts state at rest with KMS (state often contains sensitive values) |
+| `aws_s3_bucket_public_access_block`                  | All four block settings set to `true`, preventing accidental exposure   |
+| `aws_dynamodb_table.terraform_locks`                 | State locking (`PAY_PER_REQUEST`, no capacity planning)                 |
 
-This code provisions and validates an **SSL/TLS certificate** for a website using AWS Certificate Manager (ACM) and
-Route 53. It has three resources that work together in sequence.
-
-#### 1\. `aws_acm_certificate` — Request the Certificate
-
-- Requests a certificate that covers **both the apex and www subdomain**
-- Uses **DNS validation** (as opposed to email), meaning AWS will verify you own the domain by checking for specific DNS
-  records
-- `create_before_destroy` ensures a new cert is provisioned before the old one is destroyed, avoiding downtime during
-  replacements
-- The commented-out `provider = aws.us_east_1` is a reminder that **CloudFront requires ACM certs to live in us-east-1
-  **, regardless of your default region
-
-#### 2\. `aws_route53_record` — Create DNS Validation Records
-
-- ACM gives back a set of `domain_validation_options` — one per domain/SAN — each containing a special DNS record AWS
-  wants to see
-- The `for_each` loop **iterates over both domains** and creates a Route 53 record for each
-- `allow_overwrite = true` prevents errors if the record already exists
-- Short `ttl = 60` helps AWS pick up the records quickly
-
-#### 3\. `aws_acm_certificate_validation` — Wait for Validation to Complete
-
-- This resource **doesn't create anything** — it's a Terraform gate that blocks until AWS confirms the certificate is
-  validated
-- It passes the FQDNs of the DNS records created above so Terraform knows what to watch
-- The 10-minute timeout gives AWS enough time to propagate and verify the DNS records
-
-#### 4\. The Overall Flow
-
-```
-Request cert (ACM)
-      │
-      │ returns domain_validation_options
-      ▼
-Create DNS records (Route 53)
-      │
-      │ AWS detects DNS records, validates ownership
-      ▼
-Wait for validation (ACM Validation)
-      │
-      ▼
-Certificate is ISSUED ✓ → ready for CloudFront / ALB
-
+```mermaid
+sequenceDiagram
+    participant TF as terraform apply
+    participant S3 as S3 state bucket
+    participant DDB as DynamoDB lock table
+    TF ->> S3: Read state
+    TF ->> DDB: Acquire lock (LockID)
+    TF ->> TF: Make changes
+    TF ->> S3: Write new state
+    TF ->> DDB: Release lock
 ```
 
-### Create an AWS KMS Key for S3 Encryption
+If a second run starts while a lock is held, it waits or fails, which prevents state corruption.
 
-- This setup uses two S3 buckets — one for website content and one for operational files such as error pages and access
-  logs.
-- CloudFront needs the `kms:Decrypt` permission to read objects from encrypted buckets via Origin Access Control.
-- The key policy also grants the S3 service access to encryption/decryption and the account root full management
-  permissions.
+> **Note:** Terraform 1.10 and later also support native S3 state locking, and DynamoDB-based locking is being phased
+> out in newer releases. Consider migrating when convenient.
 
-### Module "kms"
+#### Module `iam` (`ga-oidc.tf`): GitHub Actions OIDC
 
-This code sets up an **AWS KMS (Key Management Service) encryption key** for securing S3 bucket data.
+GitHub Actions authenticates to AWS with short-lived tokens, so no long-lived AWS credentials are stored in GitHub.
 
-#### 1\. `aws_kms_key` — Creates the KMS Key
-
-- A **7-day deletion window** — if you delete the key, AWS waits 7 days before permanently destroying it (safety net)
-- **Automatic key rotation enabled** — AWS rotates the cryptographic material yearly, a security best practice
-- **Tags** merging common project tags with key-specific metadata (name, type, purpose)
-
-#### 2\. `aws_kms_alias` — Creates a Human-Readable Alias
-
-KMS keys have unwieldy IDs by default. This creates a friendly alias like `alias/myproject-encrypt-s3`, making it easier
-to reference in other services or the AWS Console.
-
-#### 3\. `aws_iam_policy_document` — Defines Who Can Use the Key
-
-This data source builds a JSON policy with **three permission statements**:
-
-- The **root account statement** is actually an AWS requirement — without it, only the key policy controls access, which
-  could lock you out. It delegates key management back to IAM.
-- CloudFront gets **read-only crypto permissions** (just Decrypt + DescribeKey) because it only needs to serve/read
-  encrypted objects, never write them.
-
-#### 4\. `aws_kms_key_policy` — Attaches the Policy to the Key
-
-This final resource takes the JSON policy document built above and actually attaches it to the KMS key, making the
-permissions active.
-
-#### 5\. Big Picture
-
-```
-KMS Key ──► used by S3 to encrypt stored objects
-         ──► used by CloudFront to decrypt objects for delivery
-         ──► managed by your AWS account via IAM
-
+```mermaid
+sequenceDiagram
+    participant GH as GitHub Actions job
+    participant AWS as AWS STS
+    GH ->> GH: GitHub issues a signed OIDC JWT
+    GH ->> AWS: AssumeRoleWithWebIdentity (token)
+    AWS ->> AWS: Verify token and repo/org conditions
+    AWS -->> GH: Temporary credentials (max 1 hour)
+    GH ->> GH: Terraform runs with those credentials
 ```
 
-### Create an S3 Website Bucket with Encryption, Versioning, and Lifecycle Policies
+Store the resulting role ARN in the `AWS_ROLE_ARN` GitHub secret.
 
-- The website bucket stores the static HTML files served through CloudFront.
-- It uses the KMS key from the previous step for server-side encryption, blocks all public access, and enables
-  versioning so you can roll back content changes.
-- A lifecycle policy expires noncurrent versions after 90 days and cleans up incomplete multipart uploads.
+---
 
-### Module "s3" — s3-website.tf
+### Phase 1: DNS and DNSSEC
 
-This code provisions a **secure, production-grade S3 bucket** designed to host a static website (HTML, CSS, JS, images)
-behind CloudFront.
+Provisions the Route 53 hosted zone and signs it with DNSSEC. After deployment, set the zone's nameservers at your
+registrar so it becomes the authoritative DNS zone for your domain.
 
-#### `random_string.bucket_suffix`
+#### Background
 
-Generates an 8-character random lowercase alphanumeric string. Since S3 bucket names must be **globally unique**,
-appending this suffix to the bucket name avoids naming collisions across AWS accounts.
+- **Amazon Route 53** is a scalable, highly available DNS service that routes users to AWS-hosted applications.
+- **DNSSEC** adds cryptographic signatures to DNS records so resolvers can verify that responses are authentic and
+  unmodified, defending against DNS spoofing and cache poisoning.
 
-#### `aws_s3_bucket.website` — The Core Bucket
+Enabling DNSSEC on AWS involves five steps: (1) create an asymmetric KMS key for signing, (2) authorize Route 53 to use
+it, (3) associate it with the hosted zone as a Key Signing Key, (4) activate DNSSEC for the zone, and (5) add the DS
+record at the registrar to complete the chain of trust. See
+the [AWS guide to configuring DNSSEC](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-configuring-dnssec.html).
 
-#### `aws_s3_bucket_logging.website` — Access Logging
+#### Module `route53`
 
-Sends access logs to a **separate S3 bucket** (`cloudfront_ops` from a logging module). Logs are prefixed with
-`access_logs/`, enabling auditing of who accessed or requested objects.
+| Resource                              | Purpose                                                                                              |
+|---------------------------------------|------------------------------------------------------------------------------------------------------|
+| `aws_route53_zone.main`               | Hosted zone for `var.domain_name`                                                                    |
+| `aws_kms_key.dnssec`                  | Signing key: `ECC_NIST_P256`, `SIGN_VERIFY` usage, 7-day deletion window, **must be in `us-east-1`** |
+| `aws_kms_alias.dnssec`                | Readable alias, for example `alias/myapp-example-com-dnssec`                                         |
+| `aws_kms_key_policy.dnssec`           | Grants Route 53 permission to use the key                                                            |
+| `aws_route53_key_signing_key.main`    | Links the KMS key to the zone as the KSK, set to `ACTIVE`                                            |
+| `aws_route53_hosted_zone_dnssec.main` | Turns DNSSEC signing on for the zone                                                                 |
+| `aws_route53_record.root` / `.www`    | Alias A records pointing to CloudFront                                                               |
 
-#### `aws_s3_bucket_server_side_encryption_configuration.website` — Encryption at Rest
-
-Encrypts all objects using **AWS KMS** (`aws:kms`) with a customer-managed key (CMK) whose ARN comes from a KMS module.
-This is stronger than the default S3-managed encryption (AES-256), giving you full control over key rotation and access
-policies.
-
-#### `aws_s3_bucket_website_configuration.website` — Static Website Hosting
-
-Enables S3's built-in static website hosting:
-
-- `index.html` is served for root/directory requests
-- `error.html` is served for 4xx errors
-
-> **Note**: Even though website hosting is enabled, public access is blocked. In practice, this bucket is accessed *
-*exclusively through CloudFront**, not directly via the S3 website endpoint.
-
-#### `aws_s3_bucket_public_access_block.website` — Security Hardening
-
-Blocks **all public access** to the bucket at every level (ACLs and bucket policies).
-
-#### `aws_s3_bucket_versioning.website` — Object Versioning
-
-Keeps a full history of every object version:
-
-- **Rollback** to a previous deployment if a bad file is uploaded
-- Protection against accidental deletions
-
-#### `aws_s3_bucket_lifecycle_configuration.website` — Cost Management
-
-| Rule                                | Behavior                                                  |
-|-------------------------------------|-----------------------------------------------------------|
-| `noncurrent_version_expiration`     | Permanently deletes old object versions after **90 days** |
-| `abort_incomplete_multipart_upload` | Cleans up failed/partial uploads after **7 days**         |
-
-#### Overall Architecture Summary
+Alias records are free, AWS-native, and update automatically, unlike A records with hard-coded IPs.
 
 ```
-CloudFront → S3 Bucket (private, encrypted, versioned)
-                  ↓ logs
-            S3 Logging Bucket (cloudfront_ops)
-
+cloudwithdarvin.com (Route 53 zone)
+  ├── DNSSEC enabled (KMS key signs all responses)
+  ├── cloudwithdarvin.com      ──alias──► CloudFront distribution
+  └── www.cloudwithdarvin.com  ──alias──► CloudFront distribution
 ```
 
-### Create S3 Ops Bucket for Error Pages and CloudFront Access Logs
+#### Manual step at the registrar
 
-- The ops bucket serves two purposes: it hosts custom error pages (404, 500) that CloudFront serves when errors occur,
-  and it receives CloudFront access logs under the `logs/` prefix.
-- Lifecycle policies transition logs to Standard-IA after 30 days, Glacier after 90 days, and delete them after one year
-  to control storage costs.
+1. Copy the four Route 53 nameservers into your registrar's nameserver settings.
+2. Add the **DS record** (shown in the Route 53 DNSSEC details) at the registrar to link your domain to the DNSSEC chain
+   of trust.
 
-### Module "s3" — s3-logging.tf
+---
 
-This Terraform code provisions a **single S3 bucket** designed to support CloudFront operations (logs, error pages,
-etc.), with a full set of security and cost-management configurations.
+### Phase 2: Core infrastructure
 
-#### 1\. `aws_s3_bucket` — The Bucket Itself
+Creates the certificate, encryption key, buckets, CloudFront distribution, WAF, and monitoring. It uses the hosted zone
+from Phase 1 for certificate validation.
 
-- Creates the S3 bucket with a **unique, randomized name** to avoid global naming conflicts.
-- `force_destroy = true` means Terraform can delete the bucket **even if it contains objects** — convenient for
-  teardowns, but be careful in production.
+#### 2.1 TLS certificate: module `acm`
 
-#### 2\. `aws_s3_bucket_ownership_controls` — Object Ownership
+CloudFront accepts certificates only from `us-east-1`, regardless of where other resources live.
 
-- Ensures that **your AWS account owns all objects** written to the bucket, even if uploaded by another account (like
-  CloudFront's logging service).
-- Required because CloudFront writes logs using a cross-account delivery mechanism that relies on ACLs.
+| Resource                         | Purpose                                                                                                                                    |
+|----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
+| `aws_acm_certificate`            | Requests one certificate covering the apex and `www`, using DNS validation. `create_before_destroy` avoids downtime during replacement.    |
+| `aws_route53_record`             | Creates the validation CNAME records from `domain_validation_options` (`for_each` over both domains, `allow_overwrite = true`, `ttl = 60`) |
+| `aws_acm_certificate_validation` | A gate that blocks until AWS confirms validation (10-minute timeout)                                                                       |
 
-#### 3\. `aws_s3_bucket_acl` — Access Control List
-
-- Sets the bucket ACL to **private** (no public access via ACL).
-
-#### 4\. `aws_s3_bucket_public_access_block` — Public Access Settings
-
-| Setting                   | Value | Meaning                                            |
-|---------------------------|-------|----------------------------------------------------|
-| `block_public_acls`       | false | Allows ACLs (needed for CloudFront logging)        |
-| `block_public_policy`     | true  | Blocks any bucket policy that grants public access |
-| `ignore_public_acls`      | false | Honors ACLs (again, for CloudFront)                |
-| `restrict_public_buckets` | true  | Prevents public access via policies                |
-
-#### 5\. `aws_s3_bucket_versioning` — Versioning
-
-Keeps **multiple versions of every object**, protecting against accidental deletions or overwrites. Useful for
-recovering overwritten log files or error pages.
-
-#### 6\. `aws_s3_bucket_server_side_encryption_configuration` — Encryption at Rest
-
-All objects are **encrypted with a customer-managed KMS key**.
-
-#### 7\. `aws_s3_bucket_lifecycle_configuration` — Cost & Hygiene Rules
-
-**Rule 1 — `abort_incomplete_uploads`** — Automatically cancels any **stalled multipart upload** after 7 days.
-
-**Rule 2 — `manage_log_files`** (prefix: `logs/`) — A tiered storage strategy to reduce costs as logs age:
-
-- **Day 0–30:** Standard (fast, full-price)
-- **Day 30–90:** Standard-IA (~45% cheaper)
-- **Day 90–365:** Glacier (~80% cheaper)
-- **After 365 days:** Deleted entirely
-
-**Rule 3 — `manage_error_pages`** (prefix: `error-pages/`) — Error pages are kept **indefinitely** (no expiration), but
-incomplete multipart uploads are still cleaned up after 7 days.
-
-#### Big Picture
-
-```
-aws_s3_bucket ← core bucket
-  ├── ownership_controls   (cross-account write support for CloudFront)
-  ├── acl                  (private, but ACL-capable)
-  ├── public_access_block  (surgical public access control)
-  ├── versioning           (object history)
-  ├── encryption           (KMS at rest)
-  └── lifecycle            (cost tiering + cleanup)
-
+```mermaid
+flowchart LR
+    A[Request certificate] --> B[Create DNS validation records]
+    B --> C[AWS detects records and validates ownership]
+    C --> D[Wait for validation]
+    D --> E["Certificate ISSUED, ready for CloudFront"]
 ```
 
-### Create CloudFront Origin Access Controls
+#### 2.2 Encryption key: module `kms`
 
-- Origin access control is a must-have policy to restrict origin access by CloudFront only, preventing direct access by
-  users or attackers. So users must access the web application through CloudFront and origin will remain private and
-  protected.
-- Origin Access Control (OAC) is the mechanism that allows CloudFront to access private S3 buckets. Two OAC resources
-  were created — one for the website bucket and one for the ops bucket's error pages — each using SigV4 signing to
-  authenticate requests to `origin_access_control_origin_type`, which is set to `s3`.
-- S3 as origin as it's easy to deploy for testing, cost effective, and highly available.
+One customer-managed key encrypts both S3 buckets.
 
-### Create CloudFront Distribution
+| Resource                  | Purpose                                                                                                                                                                      |
+|---------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `aws_kms_key`             | 7-day deletion window, **automatic annual rotation**, merged common and key-specific tags                                                                                    |
+| `aws_kms_alias`           | Friendly alias, for example `alias/myproject-encrypt-s3`                                                                                                                     |
+| `aws_iam_policy_document` | Three statements: account root (required, delegates management to IAM and prevents lock-out), S3 service access, and CloudFront read-only (`kms:Decrypt`, `kms:DescribeKey`) |
+| `aws_kms_key_policy`      | Attaches the policy to the key                                                                                                                                               |
 
-- The distribution is the central resource that ties everything together. It defines two origins (_the backend sources
-  from where CloudFront fetches content_): the website bucket for static content and the ops bucket for error pages.
-- The distribution is configured with aliases for both the root domain and the www subdomain, and uses `index.html` as
-  the default root object, so visitors hitting the base URL get the homepage.
-- The default cache behavior routes all requests to the website bucket. It redirects HTTP visitors to HTTPS
-  automatically.
-- The Managed-SecurityHeadersPolicy AWS policy is also attached, which adds security headers like
-  Strict-Transport-Security, X-Content-Type-Options, and X-Frame-Options to all responses.
+CloudFront needs `kms:Decrypt` to read KMS-encrypted objects through OAC.
 
-### Cache Policies
+#### 2.3 Storage: module `s3`
 
-- Cache policies in CloudFront distribution are managed from distribution cache behavior:
+Two private buckets with randomized names (`random_string.bucket_suffix`, 8 characters) to avoid global naming
+collisions.
 
-    - **HTML Content Policy**
-    - **Static Assets Policy**
-- An ordered cache behavior matches the `/error-pages/*` path pattern and routes those requests to the ops bucket — a
-  separate behavior is needed because the error pages are stored in a different origin than the website content.
+**Website bucket** (`s3-website.tf`) holds the static files served through CloudFront.
 
-- Custom error responses map the HTTP 404, 403, and 500 error codes to the corresponding error pages.
+| Resource                                             | Behavior                                                                                            |
+|------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `aws_s3_bucket_logging`                              | Sends access logs to the ops bucket under `access_logs/`                                            |
+| `aws_s3_bucket_server_side_encryption_configuration` | SSE-KMS with the customer-managed key                                                               |
+| `aws_s3_bucket_public_access_block`                  | Blocks all public access                                                                            |
+| `aws_s3_bucket_versioning`                           | Enables rollback and protects against accidental deletes                                            |
+| `aws_s3_bucket_website_configuration`                | `index.html` and `error.html` defined, but the bucket is reached only through CloudFront            |
+| `aws_s3_bucket_lifecycle_configuration`              | Noncurrent versions expire after **90 days**; incomplete multipart uploads aborted after **7 days** |
 
-- Finally, the access logging writes to the ops bucket under the `logs/` prefix, and the ACM certificate from the
-  previous step enables HTTPS on the custom domain.
+**Ops bucket** (`s3-logging.tf`) hosts the custom error pages and receives CloudFront access logs.
 
-### Create Route 53 A Records for CloudFront
+| Resource                            | Behavior                                                                            |
+|-------------------------------------|-------------------------------------------------------------------------------------|
+| `aws_s3_bucket`                     | `force_destroy = true`, convenient for teardown but **use with care in production** |
+| `aws_s3_bucket_ownership_controls`  | Ensures your account owns objects written by CloudFront's log delivery              |
+| `aws_s3_bucket_acl`                 | Private (ACLs are required for CloudFront standard logging)                         |
+| `aws_s3_bucket_public_access_block` | See table below                                                                     |
+| `aws_s3_bucket_versioning`          | Object history for logs and error pages                                             |
+| Encryption                          | SSE-KMS with the customer-managed key                                               |
 
-In this step, two **alias A records** were created — one for the root domain and one for `www` — to point to the
-CloudFront distribution.
+| Public access setting     | Value   | Reason                                   |
+|---------------------------|---------|------------------------------------------|
+| `block_public_acls`       | `false` | ACLs needed for CloudFront logging       |
+| `block_public_policy`     | `true`  | Blocks policies that grant public access |
+| `ignore_public_acls`      | `false` | Honors ACLs for CloudFront logging       |
+| `restrict_public_buckets` | `true`  | Prevents public access via policies      |
 
-#### Configure the Two S3 Bucket Policies for CloudFront Access
+Lifecycle rules for the ops bucket:
 
-- The bucket policies are what actually grant CloudFront permission to access the S3 buckets through OAC.
-- The website bucket policy allows `s3:GetObject` for the CloudFront service principal, scoped to the distribution's
-  ARN.
-- The ops bucket policy has two statements: `s3:GetObject` scoped to the `error-pages/*` prefix for serving error pages,
-  and `s3:PutObject` scoped to the `logs/*` prefix for writing access logs.
+| Rule                       | Prefix         | Behavior                                                                 |
+|----------------------------|----------------|--------------------------------------------------------------------------|
+| `abort_incomplete_uploads` | all            | Cancel stalled multipart uploads after 7 days                            |
+| `manage_log_files`         | `logs/`        | Standard (days 0–30), Standard-IA (30–90), Glacier (90–365), then delete |
+| `manage_error_pages`       | `error-pages/` | Kept indefinitely; incomplete uploads cleaned after 7 days               |
 
-### Security Response Headers Policies
+#### 2.4 CloudFront: module `cloudfront`
 
-Adding these response headers can provide information about attacks to the browser and protect users from becoming a
-victim if our website gets compromised. While using WAF in our example and applying rules, if our rules are incorrect or
-not covered through WAF, it's a good practice to add response header policies.
+**Origin Access Control.** Two OAC resources (one per bucket, origin type `s3`) use SigV4 signing so that only
+CloudFront can read from the buckets. Users cannot bypass the CDN and reach the origin directly.
 
-### Why Response Headers?
+**Origins**
 
-Response headers control browser behavior for:
+| Origin                  | Purpose                                       |
+|-------------------------|-----------------------------------------------|
+| `website_bucket`        | Site content                                  |
+| `cloudfront_ops_bucket` | Error pages (logs are written to this bucket) |
 
-- **Security**: Prevent attacks like XSS, clickjacking, iframe embedding, and more
-- **Performance**: Enable compression and caching
-- **Compliance**: Help web application meet security standards and regulations
+**Distribution settings**
 
-### Module "cloudfront"
+- Aliases for the root domain and `www`; ACM certificate attached; TLS 1.2 minimum (`TLSv1.2_2021`)
+- `redirect-to-https` for all viewers; IPv6 enabled
+- Default root object `index.html`
+- WAF Web ACL attached; optional geo-restriction through a variable
+- Standard logging to the ops bucket under `logs/`
 
-This module sets up a **CloudFront CDN distribution** for a static website hosted on S3, with security, caching, and
-access control configurations.
+**Cache behaviors** (evaluated top to bottom, first match wins)
 
-#### 1\. Origin Access Controls (OAC)
+| #       | Path pattern                                         | Notes                            |
+|---------|------------------------------------------------------|----------------------------------|
+| 1       | `/assets/img/{bg,misc,portfolio,profile,services}/*` | Long-term caching (up to 1 year) |
+| 2       | `/assets/img/*`                                      | Remaining images                 |
+| 3       | `/assets/css/*.css`                                  | Stylesheets                      |
+| 4       | `/assets/js/*.js`                                    | JavaScript                       |
+| 5       | `/assets/vendor/**`                                  | Third-party assets               |
+| 6       | `/error-pages/*`                                     | Served from the **ops** bucket   |
+| Default | `*`                                                  | HTML pages, shorter TTL          |
 
-These lock down the S3 buckets so **only CloudFront can read from them** — not the public directly. It uses AWS's sigv4
-signing protocol to authenticate CloudFront's requests to S3.
+**Cache policies**
 
-#### 2\. Response Header Policies
-
-Two policies are defined:
-
-- `security_headers` — Adds HTTP security headers to every response:
-    - _X-Content-Type-Options: nosniff_ — prevents MIME-type sniffing
-    - _X-Frame-Options: DENY_ — blocks the site from being embedded in iframes
-    - _Referrer-Policy_ — controls what referrer info is sent
-    - _Strict-Transport-Security (HSTS)_ — forces HTTPS for 1 year, including subdomains
-- `cors_policy` — Allows cross-origin GET/HEAD/OPTIONS requests from any origin (wildcard `*`)
-
-#### 3\. The CloudFront Distribution
-
-The core resource, with two **origins**:
-
-| Origin                  | Purpose                                 |
-|-------------------------|-----------------------------------------|
-| `website_bucket`        | Serves the actual site content          |
-| `cloudfront_ops_bucket` | Serves error pages + stores access logs |
-
-Key settings:
-
-- **HTTPS enforced** everywhere (redirect-to-https)
-- **IPv6 enabled**
-- **Default root object** is `index.html`
-- **WAF (Web ACL)** attached for request filtering
-- **Geo-restriction** optionally configurable via a variable
-
-#### 4\. Cache Behaviors (in Priority Order)
-
-CloudFront evaluates these top-to-bottom, using the first match:
-
-1. `/assets/img/{bg,misc,portfolio,profile,services}/*` — dynamic block covering 5 specific image subfolders, long-term
-   caching (up to 1 year)
-2. `/assets/img/*` — catches any remaining images directly under `/img/`
-3. `/assets/css/*.css` — stylesheets
-4. `/assets/js/*.js` — JavaScript files
-5. `/assets/vendor/**` — third-party vendor assets
-6. `/error-pages/*` — served from the ops bucket, not the website bucket
-7. **Default behavior** — catches everything else (HTML pages), uses a shorter cache TTL
-
-#### 5\. Cache Policies
-
-| Policy          | Default TTL | Max TTL | Use Case        |
+| Policy          | Default TTL | Max TTL | Use             |
 |-----------------|-------------|---------|-----------------|
 | `static_assets` | 1 day       | 1 year  | Images, CSS, JS |
 | `html_content`  | 1 hour      | 1 day   | HTML pages      |
 
-#### 6\. Custom Error Pages
+**Custom error responses**
 
-| HTTP Error | Shown Page                                                                         |
-|------------|------------------------------------------------------------------------------------|
-| 404        | `/error-pages/404.html`                                                            |
-| 403        | `/error-pages/404.html` (treats forbidden as not found — hides internal structure) |
-| 500        | `/error-pages/500.html`                                                            |
+| HTTP error | Page served             | Note                                                                  |
+|------------|-------------------------|-----------------------------------------------------------------------|
+| 404        | `/error-pages/404.html` |                                                                       |
+| 403        | `/error-pages/404.html` | Treats "forbidden" as "not found" to avoid revealing bucket structure |
+| 500        | `/error-pages/500.html` |                                                                       |
 
-#### 7\. S3 Bucket Policies
+**Security response headers policy** applies to every response:
 
-Two IAM policies are attached to the S3 buckets, granting CloudFront permission to:
+| Header                            | Effect                                        |
+|-----------------------------------|-----------------------------------------------|
+| `Strict-Transport-Security`       | Forces HTTPS for 1 year, including subdomains |
+| `X-Content-Type-Options: nosniff` | Prevents MIME sniffing                        |
+| `X-Frame-Options: DENY`           | Blocks iframe embedding (clickjacking)        |
+| `Referrer-Policy`                 | Controls referrer information                 |
 
-- `s3:GetObject` from the website bucket (to serve content)
-- `s3:GetObject` from `/error-pages/*` in the ops bucket
-- `s3:PutObject` to `/logs/*` in the ops bucket (to write access logs)
+These headers are defense in depth: they still protect users if a WAF rule is missing or misconfigured. A separate
+`cors_policy` allows cross-origin `GET`, `HEAD`, and `OPTIONS` from any origin (`*`); tighten this if your site does not
+need it.
 
-#### Summary Architecture
+**S3 bucket policies** grant CloudFront (scoped to this distribution's ARN) exactly what it needs:
 
-```
-User → WAF → CloudFront → S3 (website bucket)    [content]
-                        → S3 (ops bucket)        [error pages + logs]
-```
+| Bucket  | Permission                                                       |
+|---------|------------------------------------------------------------------|
+| Website | `s3:GetObject`                                                   |
+| Ops     | `s3:GetObject` on `error-pages/*` and `s3:PutObject` on `logs/*` |
 
-### Security Layer — AWS WAF
+**DNS records.** Two alias A records (root and `www`) point to the distribution (created in the `route53` module).
 
-AWS Web Application Firewall (WAF) is a security service that can filter malicious requests and provide protection from
-intruders. It can block your application from attacks like SQL injection, cross-site scripting, and more. We can add
-rate limits to get protection from DDOS attacks. We can restrict access from countries, add captcha, and other rules
-based on our use case. We add AWF rules and enable metrics for it.
+#### 2.5 Web application firewall: module `waf`
 
-- AWS WAF must be in `us-east-1` for CloudFront.
-- We have added a Rate Limiting rule to allow 20 requests in 5 minutes.
+The Web ACL is scoped to `CLOUDFRONT` (must be created in `us-east-1`) with a default action of **allow**; rules block
+malicious traffic.
 
-#### WAF Rules We Have Added
+| Priority | Rule                                   | Action                     | Purpose                                           |
+|----------|----------------------------------------|----------------------------|---------------------------------------------------|
+| 1        | `AWSManagedRulesCommonRuleSet`         | Block (body size override) | OWASP Top 10 style protections, XSS, bad requests |
+| 2        | `AWSManagedRulesKnownBadInputsRuleSet` | Block                      | Known exploit patterns (for example Log4j)        |
+| 3        | `RateLimitRule`                        | Block                      | IPs exceeding **2000 requests per 5 minutes**     |
+| 4        | `BotControlRuleSet`                    | Block (COMMON level)       | Common bots                                       |
+| 5        | `AmazonIpReputationList`               | Count                      | Flags bad-reputation IPs                          |
+| 6        | `AnonymousIpList`                      | Block                      | VPNs, Tor, proxies                                |
+| 7        | `SQLiRuleSet`                          | Block                      | SQL injection                                     |
+| 8        | `LinuxRuleSet`                         | Count                      | Linux-specific exploits (monitoring)              |
+| 9        | `UnixRuleSet`                          | Count                      | Unix-specific exploits (monitoring)               |
+| 10       | `WindowsRuleSet`                       | Block (shell override)     | Windows exploits                                  |
+| 11       | `block-bad-user-agents`                | Block                      | Scanners such as sqlmap and nikto                 |
 
-- **Common Rule Set**: Blocks SQL injection, XSS, and other OWASP Top 10 attacks
-- **Known Bad Inputs**: Blocks requests with malicious patterns
-- **Rate Limiting**: Blocks IPs making more than 20 requests per 5 minutes
-- WAF rules to block or allow access from specific countries
-- We can allow or deny specific IP address or range
+A geo-restriction rule is included but commented out; enable it to allow or deny specific countries. IP allow/deny lists
+can be added the same way.
 
-### Module "waf"
+**Design notes**
 
-This module sets up a **Web Application Firewall (WAF)** for a CloudFront distribution on AWS.
+- **Count vs. block.** Several rules run in *count* mode so you can observe real traffic before blocking, which helps
+  avoid false positives.
+- **Rule overrides.** Sub-rules such as `SizeRestrictions_BODY` and `WindowsShellCommands_BODY` are overridden to
+  prevent false positives on legitimate large requests.
+- **Anonymous IP blocking** will also block legitimate visitors on VPNs. Review this against your audience.
 
-#### 1\. Main Resource: `aws_wafv2_web_acl`
+**Supporting resources**
 
-The WAF is scoped to `CLOUDFRONT` (meaning it protects a CloudFront distribution globally) and its **default action is
-to allow** — traffic is allowed unless a rule blocks it.
+- `aws_wafv2_web_acl_logging_configuration` keeps only BLOCK and COUNT events (drops ALLOW to reduce volume).
+- `aws_cloudwatch_log_group` named `aws-waf-logs-<prefix>` (the prefix is **required** by AWS), 7-day retention.
 
-#### 2\. Rules (in Priority Order)
+#### 2.6 Monitoring and alerts: modules `cloudwatch` and `sns`
 
-| Priority | Rule                                   | Action                          | Purpose                                           |
-|----------|----------------------------------------|---------------------------------|---------------------------------------------------|
-| 1        | `AWSManagedRulesCommonRuleSet`         | Block (with body size override) | General protections (XSS, bad requests, etc.)     |
-| 2        | `AWSManagedRulesKnownBadInputsRuleSet` | Block                           | Blocks known exploit patterns (Log4j, etc.)       |
-| 3        | `RateLimitRule`                        | Block                           | Blocks IPs exceeding **2000 req / 5 min**         |
-| 4        | `BotControlRuleSet`                    | Block (COMMON level)            | Detects and blocks common bots                    |
-| 5        | `AmazonIpReputationList`               | Count only                      | Flags IPs with bad reputation (not blocking yet)  |
-| 6        | `AnonymousIpList`                      | Block                           | Blocks VPNs, Tor, proxies                         |
-| 7        | `SQLiRuleSet`                          | Block                           | SQL injection protection                          |
-| 8        | `LinuxRuleSet`                         | Count only                      | Detects Linux-specific exploits (monitoring mode) |
-| 9        | `UnixRuleSet`                          | Count only                      | Detects Unix-specific exploits (monitoring mode)  |
-| 10       | `WindowsRuleSet`                       | Block (with shell override)     | Windows exploit protection                        |
-| 11       | `block-bad-user-agents`                | Block                           | Blocks scanners like sqlmap and nikto             |
+See [Monitoring and Alerting](#8-monitoring-and-alerting).
 
-There's also a **commented-out geo-restriction rule** that would block traffic from specific countries if enabled.
+#### 2.7 Outputs
 
-#### A Few Things Worth Noting
+After deployment, Terraform outputs the website URLs:
 
-- **Count vs. Block**: Several rules (IP reputation, Linux, Unix) are set to _count_ instead of block. This is a common
-  pattern when you want to **observe traffic first** before committing to blocking it.
-- **Rule overrides**: Some rules have specific sub-rules overridden to _allow_ (e.g., `SizeRestrictions_BODY`,
-  `WindowsShellCommands_BODY`), likely to prevent false positives on legitimate large uploads or specific request
-  patterns.
+- `https://cloudwithdarvin.com`
+- `https://www.cloudwithdarvin.com`
 
-#### 3\. Supporting Resources
-
-- `aws_wafv2_web_acl_logging_configuration` — Enables logging, but only keeps _BLOCK_ and _COUNT_ events (drops _ALLOW_
-  logs to reduce volume).
-- `aws_cloudwatch_log_group` — Creates a log group named `aws-waf-logs-<prefix>` (the `aws-waf-logs-` prefix is *
-  *required** by AWS) with a 7-day retention period.
-
-### CloudWatch Dashboard for CloudFront Monitoring
-
-Creating a CloudWatch Dashboard and alarms. Alarms have been created for 4xx and 5xx errors. Ideally in production we
-usually monitor 403 and 5xx alerts since these apply to webapp domains.
-
-### Module "cloudwatch"
-
-This module sets up **AWS CloudWatch monitoring** for a CloudFront distribution. It has two main parts:
-
-#### 1\. CloudWatch Dashboard
-
-Creates a visual dashboard with three panels:
-
-- **CloudFront Performance** — tracks Cache Hit Rate, Origin Latency, and total Requests
-- **Error Rates** — tracks 4xx (client errors) and 5xx (server errors) percentages
-- **Data Transfer** — tracks bytes downloaded and uploaded
-
-All panels use a 5-minute interval (`period = 300`) and display data as time-series graphs.
-
-#### 2\. CloudWatch Alarms (4 Total)
-
-Each alarm watches a specific metric and fires if a threshold is breached over multiple evaluation periods. They all
-notify via an SNS topic (`var.sns_topic_arn`):
-
-| Alarm                 | Condition             | Sensitivity |
-|-----------------------|-----------------------|-------------|
-| `high_4xx_error_rate` | 4xx errors \> 5%      | 2 periods   |
-| `high_5xx_error_rate` | 5xx errors \> 1%      | 2 periods   |
-| `low_cache_hit_rate`  | Cache hit rate \< 80% | 3 periods   |
-| `high_origin_latency` | Origin latency \> 3s  | 3 periods   |
-
-> _One thing worth noting_: CloudFront metrics must be read from **us-east-1** regardless of where your distribution
-> serves traffic — that's hardcoded and correct, since CloudFront metrics are only published to that region.
-
-### Amazon SNS Topic for CloudFront Alerts
-
-#### Module "sns"
-
-This module sets up an **AWS SNS (Simple Notification Service)** notification system for CloudFront alerts. There are
-two resources:
-
-##### 1\. `aws_sns_topic` — The Notification Channel
-
-This creates an **SNS Topic**, which acts as a messaging hub — anyone subscribed to it will receive messages published
-to it.
-
-- `name` — dynamically built using a prefix variable (e.g., `myapp-cloudfront-alerts`)
-- `tags` — merges common shared tags with topic-specific ones (Name, Type, Purpose)
-
-##### 2\. `aws_sns_topic_subscription` — The Email Subscribers
-
-This subscribes **one or more email addresses** to the topic above.
-
-#### How It Fits Together
-
-```
-CloudFront Event / CloudWatch Alarm
-      │
-      ▼
-SNS Topic (cloudfront_alerts)
-      │
-      ├──► email1@...
-      └──► email2@... ← one subscription resource per address
-
-```
-
-When something publishes an alert to this SNS topic (e.g., a CloudWatch alarm detecting high error rates on CloudFront),
-**every subscribed email address gets notified**.
-
-> **Note:** _AWS will send a confirmation email to each address before they start receiving alerts — subscriptions
-aren't active until confirmed._
-
-### The Outputs
-
-After deployment, you'll get:
-
-- Website URLs ([https://cloudwithdarvin.com](https://cloudwithdarvin.com))
-- Website URLs ([https://www.cloudwithdarvin.com](https://www.cloudwithdarvin.com))
-
-![0-Outputs.png](../Screenshot%20verification/0-Outputs.png)
+![Terraform outputs](../Screenshot%20verification/0-Outputs.png)
 
 ---
 
-### Step 4: Deploy Content and Invalidate Cache
+### Phase 3: Content deployment
 
-The final stage separates content deployment from infrastructure, allowing static website updates without re-running
-Terraform. Static HTML files are in the content folder, and a GitHub Actions workflow (`deploy.yml`)
-automates deployment on every merge to the main branch.
+Content deployment is separated from infrastructure, so site updates do not require re-running the full Terraform
+infrastructure workflow.
 
-### Workflow GitHub Actions
+#### GitHub Actions workflows
 
-- **`checkov.yml`** — Automated security scanning framework using Checkov to detect Terraform
-  misconfigurations at both repository and pull request (PR) levels.
-- **`deploy.yml`** — Terraform workflow to provision infrastructure and deploy the Static Website with
-  OIDC, synchronize Website content if something changed, and invalidate a CloudFront cache, forcing edge servers to
-  fetch fresh content from the origin.
+| Workflow                  | Purpose                                                                                                                                                 |
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `terraform-checkov.yml`   | Scans Terraform for misconfigurations on the repository and on pull requests                                                                            |
+| `terraform-infracost.yml` | Posts infrastructure cost estimates on pull requests                                                                                                    |
+| `website-deployment.yml`  | Authenticates with OIDC, provisions infrastructure, syncs changed website content, and invalidates the CloudFront cache. Runs on every merge to `main`. |
 
-### Invalidate CloudFront Cache
+#### Cache invalidation
 
-Create a CloudFront cache invalidation for all paths (`/*`). Without this step, CloudFront would continue serving the
-previously cached version for up to 24 hours (the default TTL of the Managed-CachingOptimized cache policy). The
-invalidation ensures visitors see the updated content immediately.
+Invalidation removes objects from CloudFront edge caches before they expire naturally, so visitors see new content
+immediately instead of a stale copy until the TTL ends.
 
-#### What is Cache Invalidation?
+**When to use it**
 
-Cache invalidation removes files from CloudFront edge caches before they expire naturally.
+- Emergency fixes and security patches
+- Content updates that must appear immediately
+- Time-sensitive launches
 
-#### When to Use Invalidation
+**How it works**
 
-- **Emergency fixes**: Critical bug fixes that can't wait for cache expiry
-- **Content updates**: When you need immediate content changes
-- **Security patches**: Urgent security updates
-- **Marketing campaigns**: Time-sensitive content launches
+1. CloudFront marks matching cached objects as stale at every edge location.
+2. The next request at each edge fetches a fresh copy from S3.
+3. Subsequent requests are served from the refreshed cache.
 
-> We should always provide specific path or files to invalidate.
-
-#### What Happens Under the Hood
-
-1. CloudFront marks all cached objects as stale across its edge locations
-2. The next request to each edge node triggers a fresh fetch from your origin (S3, EC2, etc.)
-3. Subsequent requests are served from the refreshed cache
-4. This pattern is common in **static site deployments** — after uploading new files to S3, you invalidate the
-   CloudFront cache so users immediately get the updated content instead of stale cached versions.
+> **Best practice:** invalidate specific paths when possible, and use `/*` only when necessary, since invalidations
+> beyond the free monthly allowance are billed per path.
 
 ---
 
-## Monitoring
+## 8. Monitoring and Alerting
 
-The project includes:
+**CloudWatch dashboard** (5-minute periods, time-series):
 
-**CloudWatch Dashboard:** Performance metrics and error rates
+| Panel                  | Metrics                                  |
+|------------------------|------------------------------------------|
+| CloudFront performance | Cache hit rate, origin latency, requests |
+| Error rates            | 4xx and 5xx percentages                  |
+| Data transfer          | Bytes downloaded and uploaded            |
 
-- **CloudWatch Alarms:**
+**CloudWatch alarms** (all notify the SNS topic):
 
-    - High 4xx error rate (\>5%)
-    - High 5xx error rate (\>1%)
-    - Low cache hit rate (\<80%)
-    - High origin latency (\>3 seconds)
-- **Access Logs**: Detailed request logs stored in S3
+| Alarm                 | Condition            | Evaluation periods |
+|-----------------------|----------------------|--------------------|
+| `high_4xx_error_rate` | 4xx > 5%             | 2                  |
+| `high_5xx_error_rate` | 5xx > 1%             | 2                  |
+| `low_cache_hit_rate`  | Cache hit rate < 80% | 3                  |
+| `high_origin_latency` | Origin latency > 3 s | 3                  |
+
+**SNS notifications** (`sns` module): an SNS topic (for example `myapp-cloudfront-alerts`) with one email subscription
+resource per address.
+
+```mermaid
+flowchart LR
+    A[CloudWatch alarm] --> T[SNS topic]
+    T --> E1[email1@example.com]
+T --> E2[email2@example.com]
+```
+
+> **Important:** AWS sends a confirmation email to each address, and subscriptions are not active until confirmed.
+>
+> CloudFront metrics are only published to `us-east-1`, so the dashboard and alarms read from that region.
+
+**Logs available**
+
+- CloudFront access logs: ops bucket, `logs/` prefix
+- S3 website bucket access logs: ops bucket, `access_logs/` prefix
+- WAF logs: CloudWatch Logs group `aws-waf-logs-<prefix>`
 
 ---
 
-## Quick Start
+## 9. Verification and Testing
 
-### Step 1 — Fork and Clone
+### 9.1 Deployment checklist
+
+| Check                    | Expected result                                                                                                                        | Evidence                                                                                                                  |
+|--------------------------|----------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| Website loads over HTTPS | Padlock shown, no browser warnings                                                                                                     | ![Website 1](../Screenshot%20verification/1-Website%201.png) ![Website 2](../Screenshot%20verification/1-Website%202.png) |
+| Unknown path             | Custom 404 page                                                                                                                        | ![Error page](../Screenshot%20verification/1-Error%20page%20not%20found.png)                                              |
+| CloudFront distribution  | Aliases `cloudwithdarvin.com` and `www.cloudwithdarvin.com`, ACM certificate attached, `TLSv1.2_2021` policy, standard logging enabled | ![Distribution](../Screenshot%20verification/6-cf-distribution%20detail.png)                                              |
+| Origins                  | Website bucket and ops bucket configured                                                                                               | ![Origins](../Screenshot%20verification/6-cf-distribution%20origins.png)                                                  |
+| Custom error responses   | 403 and 404 serve the 404 page; 500 serves the 500 page (from `/error-pages/` in the ops bucket)                                       | ![Error pages](../Screenshot%20verification/6-cf-distribution%20error%20pages.png)                                        |
+| Route 53 zone            | Alias A records (root, `www`), NS and SOA records, ACM validation CNAMEs                                                               | ![Route 53](../Screenshot%20verification/2-Route%2053.png)                                                                |
+| DNSSEC                   | Signing status **Active**, KSK status active                                                                                           | ![DNSSEC](../Screenshot%20verification/2-Route%20DNSSEC%20Key.png)                                                        |
+
+You can also validate DNSSEC and TLS from the command line:
 
 ```bash
-$ git clone https://github.com/darvin-rakotomalala/s3-static-website
-$ cd s3-static-website
-
+dig +dnssec cloudwithdarvin.com
+curl -sI https://cloudwithdarvin.com | head -n 15     # check security headers
+curl -sI http://cloudwithdarvin.com | head -n 5       # expect a redirect to HTTPS
 ```
 
-### Step 2 — Configure Terraform
+### 9.2 WAF testing
 
-Edit `s3-static-website/dev-terraform.tfvars` to match your target region and preferences. No secrets go here — just
-region, domain name, and default tags.
+> Run these tests only against infrastructure you own.
 
-### Step 3 — Deploy Infrastructure
+A **403** response means the WAF blocked the request; a **200** means it passed through.
 
 ```bash
-$ cd s3-static-website
-$ terraform init
-$ terraform fmt -recursive
-$ terraform validate
-$ terraform plan -var-file="dev-terraform.tfvars" -no-color -out=TFplan.JSON
-$ terraform apply -var-file="dev-terraform.tfvars" -auto-approve
+# SQL injection
+curl -i "https://cloudwithdarvin.com/?id=1' OR '1'='1"
 
+# Cross-site scripting
+curl -i "https://cloudwithdarvin.com/?q=<script>alert('xss')</script>"
+
+# Path traversal (--path-as-is stops curl from normalizing the ../ segments)
+curl -i --path-as-is "https://cloudwithdarvin.com/../../../../etc/passwd"
+
+# Blocked User-Agent (bad bot rule)
+curl -i -A "sqlmap/1.0" https://cloudwithdarvin.com/
+
+# Rate limiting: send more requests than the threshold (2000 per 5 minutes)
+for i in {1..2500}; do curl -s -o /dev/null -w "%{http_code}\n" https://cloudwithdarvin.com/; done | sort | uniq -c
 ```
+
+**Automated scanning**
+
+```bash
+nikto -h https://cloudwithdarvin.com
+nuclei -u https://cloudwithdarvin.com -t waf-bypass/
+```
+
+After testing, review the WAF logs in CloudWatch to confirm which rules matched.
 
 ---
 
-## Verification
+## 10. Troubleshooting
 
-- After deploying all three steps, the site was live at _[https://cloudwithdarvin.com/](https://cloudwithdarvin.com/)_
-  with a secure connection confirmed by the browser.
+### CSS, JS, and images do not load
 
-![1-Website 1.png](../Screenshot%20verification/1-Website%201.png)
+**Symptom.** The page renders without styles, scripts, or images.
 
-![1-Website 2.png](../Screenshot%20verification/1-Website%202.png)
+![Troubleshooting](../Screenshot%20verification/Troubleshooting.png)
 
-![1-Error page not found.png](../Screenshot%20verification/1-Error%20page%20not%20found.png)
+**Root cause.** Files uploaded to S3 had no `Content-Type` metadata, so browsers could not interpret them.
 
-- On the AWS console, the CloudFront distribution showed the alternate domain names (`cloudwithdarvin.com` and
-  `www.cloudwithdarvin.com`), the attached ACM certificate, the TLSv1.2\_2021 security policy, and standard logging
-  enabled.
-
-![6-cf-distribution detail.png](../Screenshot%20verification/6-cf-distribution%20detail.png)
-
-- The two S3 origins — one for website content and one for the ops bucket — were configured correctly.
-
-![6-cf-distribution origins.png](../Screenshot%20verification/6-cf-distribution%20origins.png)
-
-- The custom error responses are in place — HTTP 403 and 404 errors serve the custom 404 page, while 500 errors serve
-  the 500 page, both from the ops bucket's `/error-pages/` prefix.
-
-![6-cf-distribution error pages.png](../Screenshot%20verification/6-cf-distribution%20error%20pages.png)
-
-- The Route 53 hosted zone shows the A records (```root``` and ```www```) aliased to CloudFront, the NS and SOA records,
-  and the
-  CNAME records created during ACM DNS validation.
-
-![2-Route 53.png](../Screenshot%20verification/2-Route%2053.png)
-
-#### DNSSEC Signing
-
-The DNSSEC signing status is shown as **Active** in the Route 53 hosted zone with the Key Signing Key (KSK) in active
-status.
-
-![2-Route DNSSEC Key.png](../Screenshot%20verification/2-Route%20DNSSEC%20Key.png)
-
-### WAF Test — Manual HTTP Requests with curl
-
-The quickest way to test specific WAF rules:
-
-```bash
-# Test a SQL injection rule
-$ curl -i "https://cloudwithdarvin.com/?id=1' OR '1'='1"
-
-# Test an XSS rule
-$ curl -i "https://cloudwithdarvin.com/?q=<script>alert('xss')</script>"
-
-# Test a path traversal rule
-$ curl -i "https://cloudwithdarvin.com/../../../../etc/passwd"
-
-# Test a blocked User-Agent (bad bot rule)
-$ curl -i -A "sqlmap/1.0" https://cloudwithdarvin.com/
-
-# Test rate limiting (send many requests quickly)
-$ for i in {1..200}; do curl -s -o /dev/null -w "%{http_code}" https://cloudwithdarvin.com/; done
-
-```
-
-A **403 response** means WAF blocked the request. A **200** means it passed through.
-
-**Automated Scanning with nikto or nuclei:**
-
-```bash
-# Install nikto (web vulnerability scanner)
-$ nikto -h https://cloudwithdarvin.com
-
-# Or use nuclei for targeted WAF bypass testing
-$ nuclei -u https://cloudwithdarvin.com -t waf-bypass/
-
-```
-
----
-
-## Troubleshooting
-
-**The Problem**: CSS, JS, and image files are not loaded when accessed on my domain.
-
-**Root Cause**: The HTML source files don't have a metadata when uploaded to the S3 bucket.
-
-![Troubleshooting.png](../Screenshot%20verification/Troubleshooting.png)
-
-**Solution**: In Terraform code, set a `mime_types` for each file.
+**Solution.** Set an explicit `content_type` for every uploaded object in Terraform:
 
 ```hcl
 locals {
@@ -1251,36 +709,86 @@ resource "aws_s3_object" "provision_source_files" {
   bucket = module.s3.s3_bucket_website_id
   for_each = fileset("${var.source_files}/", "**/*.*")
 
-  key           = each.value
-  source        = "${var.source_files}/${each.value}"
-  content_type = lookup(local.mime_types, split(".", each.value)[length(split(".", each.value)) - 1], "application/octet-stream")
+  key    = each.value
+  source = "${var.source_files}/${each.value}"
+  content_type = lookup(
+    local.mime_types,
+    split(".", each.value)[length(split(".", each.value)) - 1],
+    "application/octet-stream"
+  )
   etag = filemd5("${var.source_files}/${each.value}")
   cache_control = startswith(each.value, "assets/") ? "public, max-age=31536000, immutable" : "no-cache"
 }
-
 ```
 
-### Cache Invalidation
+### Old content is still served after the fix
 
-After setting up the `mime_types`, CloudFront may still be serving cached content. Go to:
+CloudFront may still hold the cached (broken) objects. Invalidate the cache:
 
-1. **Invalidations tab → Create invalidation**
-2. Add path: `/*`
-3. Submit and wait ~1 min
+1. Open the distribution, then **Invalidations → Create invalidation**.
+2. Add the path `/*`.
+3. Submit and wait about one minute.
 
-After invalidating on path (`/*`), the result becomes the correct page.
+After the invalidation completes, the correct page is served.
+
+### Other common issues
+
+| Symptom                                       | Likely cause                                                        | Fix                                                                      |
+|-----------------------------------------------|---------------------------------------------------------------------|--------------------------------------------------------------------------|
+| Certificate stays in "Pending validation"     | NS records at the registrar not yet updated                         | Point the registrar to the Route 53 nameservers and wait for propagation |
+| Domain fails to resolve after enabling DNSSEC | DS record missing or incorrect at the registrar                     | Re-copy the DS record from Route 53                                      |
+| Certificate cannot be attached to CloudFront  | Certificate created outside `us-east-1`                             | Recreate in `us-east-1`                                                  |
+| 403 from CloudFront for valid pages           | OAC or bucket policy mismatch, or KMS key policy missing CloudFront | Check bucket policy scope and `kms:Decrypt` grant                        |
+| Legitimate users blocked                      | WAF rule false positive (for example anonymous IP list)             | Switch the rule to count mode and review WAF logs                        |
+| No alert emails received                      | SNS subscription not confirmed                                      | Confirm the subscription email                                           |
 
 ---
 
-## Conclusion
+## 11. Cost and Performance Optimization
 
-In this project, we walked through deploying a production-grade secure static website on AWS using Terraform —
-provisioning DNS with Route 53, building the infrastructure with S3, CloudFront, ACM, KMS, WAF, and automating content
-deployment through GitHub Actions.
+**Performance**
 
-_If you have a static site idea — a portfolio, documentation, a landing page — and were wondering how to host it on AWS
-with proper security and automation, **this project has the blueprint**._
+- Enable compression, including for text-based assets, in the cache policy.
+- Keep the cache key minimal: include only the headers, cookies, and query strings your site needs.
+- Use long TTLs for fingerprinted assets and short TTLs for HTML.
+
+**Cost**
+
+- Choose the right CloudFront **price class** and restrict geographies to where your users are.
+- Use different TTLs for static and frequently changing content.
+- Invalidate carefully, targeting specific paths where possible.
+- Lifecycle rules tier or delete old logs and noncurrent object versions automatically.
+- **Infracost** estimates cost changes on every pull request.
+
+**Availability**
+
+- Consider origin groups (primary and secondary origins) for failover if requirements grow.
 
 ---
 
-_Project by Darvin | Deploy Secure Static Website_
+## 12. Cleanup
+
+Destroy in **reverse order** of deployment, and take care with DNSSEC:
+
+1. **Remove the DS record at your registrar first.** Destroying the signing key while the DS record still exists makes
+   the domain fail validation and become unreachable for validating resolvers.
+2. Empty any buckets that will not be force-destroyed (versioned buckets must have all versions removed).
+3. Destroy content and infrastructure, then DNS, then the bootstrap resources last.
+4. KMS keys enter their 7-day deletion window and cannot be used during it.
+
+```bash
+terraform destroy -var-file="dev-terraform.tfvars"
+```
+
+---
+
+## 13. Conclusion
+
+This project delivers a production-grade, secure static website on AWS using Terraform: signed DNS with Route 53, a
+private encrypted origin on S3, a global edge with CloudFront, WAF protection, TLS from ACM, and automated, keyless
+deployment through GitHub Actions. If you have a static site idea, such as a portfolio, documentation, or a landing
+page, this project is a blueprint for hosting it on AWS with proper security and automation.
+
+---
+
+*Project by Darvin · Deploy Secure Static Website*
